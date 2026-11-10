@@ -1,0 +1,62 @@
+{
+  "schema_version": "1.0",
+  "node_id": "Archetype_B (双向同频高回报型)",
+  "node_hash": "node_demo_b02",
+  "span": {
+    "start_time": "2026-08-01 10:00:00",
+    "end_time": "2026-11-08 22:00:00",
+    "span_days": 100,
+    "active_days": 86
+  },
+  "volume": {
+    "total_messages": 2120,
+    "daily_avg_messages": 21.2,
+    "self_messages": 1070,
+    "peer_messages": 1050,
+    "self_msg_pct": 50.5,
+    "peer_msg_pct": 49.5,
+    "self_chars": 15800,
+    "peer_chars": 15200,
+    "char_investment_ratio": 1.04,
+    "self_avg_chars": 14.8,
+    "peer_avg_chars": 14.5,
+    "self_long_msgs": 8,
+    "peer_long_msgs": 8
+  },
+  "dynamics": {
+    "total_sessions": 92,
+    "self_initiations": 47,
+    "peer_initiations": 45,
+    "self_initiation_pct": 51.1,
+    "peer_initiation_pct": 48.9,
+    "self_closings": 46,
+    "peer_closings": 46,
+    "late_night_messages": 530,
+    "late_night_pct": 25.0,
+    "silence_breaks": []
+  },
+  "latency": {
+    "self": {
+      "mean_sec": 120.0,
+      "median_sec": 22,
+      "fast_reply_pct": 58.0,
+      "slow_reply_pct": 0.0
+    },
+    "peer": {
+      "mean_sec": 115.0,
+      "median_sec": 20,
+      "fast_reply_pct": 61.0,
+      "slow_reply_pct": 0.0
+    }
+  },
+  "monthly_vectors": {
+    "2026-08": { "total": 320, "self_cnt": 165, "peer_cnt": 155, "self_chars": 2400, "peer_chars": 2250, "self_init_pct": 54.0 },
+    "2026-09": { "total": 540, "self_cnt": 275, "peer_cnt": 265, "self_chars": 4050, "peer_chars": 3900, "self_init_pct": 52.0 },
+    "2026-10": { "total": 780, "self_cnt": 390, "peer_cnt": 390, "self_chars": 5800, "peer_chars": 5650, "self_init_pct": 50.0 },
+    "2026-11": { "total": 480, "self_cnt": 240, "peer_cnt": 240, "self_chars": 3550, "peer_chars": 3400, "self_init_pct": 50.0 }
+  },
+  "indices": {
+    "surface_vitality_score": 81.0,
+    "symmetry_index": 97.4
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "schema_version": "1.0",
+  "node_id": "Archetype_A (高秒回广谱内耗型)",
+  "node_hash": "node_demo_a01",
+  "metrics": {
+    "development_probability_pct": 3.3,
+    "expected_return_score": 5.0,
+    "expected_gain": 0.2,
+    "energy_burn_cost": 100.0,
+    "net_jev_score": -99.8,
+    "roi_ratio": 0.0
+  },
+  "decision": {
+    "verdict_code": "STOP_AND_PIVOT",
+    "verdict_label": "🛑 立即止损 · 停止投入精力（转向个人硬核主线）",
+    "continue_investing": false,
+    "recommended_self_initiation_pct": 0.0,
+    "action_directive": "明确结论：【不需要、也不应该继续投入任何精力】。这段关系去滤镜后的正向发展概率仅为 3.3%，净期望值 JEV 为 -99.8（严重负收益）。请立即将主动发起话题率降至 0%，停止提供任何无偿资源与长文情绪价值，将 100% 的时间与多巴胺收回个人硬核技术与成长主线。"
+  }
+}

@@ -1,0 +1,62 @@
+{
+  "schema_version": "1.0",
+  "node_id": "Archetype_A (高秒回广谱内耗型)",
+  "node_hash": "node_demo_a01",
+  "surface_vitality_score": 88.6,
+  "defilter_multiplier": 0.05,
+  "defiltered_exclusivity_score": 4.4,
+  "illusion_gap": 84.2,
+  "online_anomalies": {
+    "high_fast_reply_passive_init": true,
+    "heavy_word_surplus": true,
+    "utilitarian_reinit": true,
+    "evasive_long_reply": false
+  },
+  "offline_signals": {
+    "broad_social_warmth": true,
+    "public_distance_cutting": true,
+    "shelf_mentality_quote": true,
+    "intermittent_utilitarian_contact": true,
+    "alibi_clubbing_conformity": true,
+    "unilateral_resource_given": true,
+    "companionship_evasion": true
+  },
+  "pathology_count": 5,
+  "detected_pathologies": [
+    {
+      "code": "PATHOLOGY_01_BROAD_WARMTH",
+      "title": "「广谱社交热情」被误读为「排他性偏爱」",
+      "severity": "CRITICAL",
+      "mechanism": "对方线上秒回率虽高（68.5%），但你承担了 79.7% 的主动破冰。她的热情属于高外向/销售型人格的广谱社交货币，对其他同伴或社交圈同样熟络主动，并非针对你的专属偏爱。",
+      "anti_illusion_advice": "永远不要用『她回得快不快、聊得多不多』判断心意，要看她的热情是否具有排他性与稀缺性。"
+    },
+    {
+      "code": "PATHOLOGY_02_PUBLIC_CUTTING",
+      "title": "私下热络与公开场合避嫌的「择偶防线管理」",
+      "severity": "CRITICAL",
+      "mechanism": "私下独处或线上闲聊时互动密集，但只要有第三人在场（如公共空间、共同圈子场所），便刻意收敛亲密感、保持社交距离。本质上是在向周围潜在择偶池释放『我目前单身未绑定』的防御信号。",
+      "anti_illusion_advice": "一个真正喜欢你的人，在公共场合藏不住眼神与身体的偏向；公开场合的刻意避嫌，就是最诚实的拒绝。"
+    },
+    {
+      "code": "PATHOLOGY_03_INTERMITTENT_SHELF",
+      "title": "「买方货架心态」与间歇性强化（断联—复联拉扯闭环）",
+      "severity": "CRITICAL",
+      "mechanism": "对方抱持『喜欢我的人很多、可以随便选』的买方傲慢，将追求者视为货架备选项。当你感到生理性下头并主动断联抽离时，对方又通过功利性求助（对接人脉/资源）或阶段性主动邀约给你释放微弱希望，形成心理学上最消耗心神的『间歇性强化 (Intermittent Reinforcement)』成瘾陷阱。",
+      "anti_illusion_advice": "断联后对方若没有带着实质性的情感诚意回归，而是以求助、借资源或闲聊试探破冰，本质只是在清点鱼塘库存。"
+    },
+    {
+      "code": "PATHOLOGY_04_ALIBI_CONFORMITY",
+      "title": "隐瞒真实行踪的双面人设与底层赛道背离",
+      "severity": "HIGH",
+      "mechanism": "在你面前用乖巧无害的理由推脱邀约，实则与小团体去酒吧熬夜并因『聚会熬穿』放你鸽子，事后辩称『去酒吧是为了合群』。无论哪句是真话，『隐瞒行踪 + 靠酒吧熬夜合群』本身即证明你们的核心价值观与人生赛道彻底背离。",
+      "anti_illusion_advice": "不必纠结她具体哪句撒了谎，当一个人需要对你伪装人设、且为了合群流连夜场时，你们早已不在同一个精神维度。"
+    },
+    {
+      "code": "PATHOLOGY_05_COMPANIONSHIP_EVASION",
+      "title": "单向失血的「资源/情绪黑洞」与核心陪伴需求闪避",
+      "severity": "CRITICAL",
+      "mechanism": "我方字数投入是其 2.19 倍并提供实质资源支持，但当你袒露脆弱、明确表达『需要陪伴』时，对方却用『免责声明』『把情绪与生活分开』『规律作息、暂时先不讨论』等零成本的理中客说教将你挡在门外——只享受你的资源与捧场红利，绝不承担任何排他性的情感陪伴责任。",
+      "anti_illusion_advice": "看一个人爱不爱你，不要看她给你回了多长的『人生建议』，要看她在你最需要陪伴时是走向你，还是用大道理把门焊死。"
+    }
+  ]
+}

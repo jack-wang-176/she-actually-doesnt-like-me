@@ -1,0 +1,49 @@
+{
+  "entities": [
+    {
+      "name": "SELF_CORE_MAINLINE",
+      "entityType": "BenchmarkAnchor",
+      "observations": [
+        "个人硬核技术研发与能力成长主线（确定性正反馈基准锚点，默认 P=95%, Net JEV=+81.2）"
+      ]
+    },
+    {
+      "name": "Archetype_A_BroadSiren",
+      "entityType": "SyntheticNode",
+      "observations": [
+        "脱敏反面原型：高秒回广谱内耗型，触发五大去滤镜病灶，裁决为 STOP_AND_PIVOT（推荐精力 0%）"
+      ]
+    },
+    {
+      "name": "Archetype_B_ReciprocalPartner",
+      "entityType": "SyntheticNode",
+      "observations": [
+        "脱敏正向原型：双向同频高回报型，言行一致且主动破冰对称，裁决为 INVEST_STEADILY"
+      ]
+    },
+    {
+      "name": "Archetype_C_PoliteAcquaintance",
+      "entityType": "SyntheticNode",
+      "observations": [
+        "脱敏中性原型：礼貌疏离观察型，无恶性病灶但热度尚低，裁决为 DOWNGRADE_OBSERVE"
+      ]
+    }
+  ],
+  "relations": [
+    {
+      "from": "PortfolioAllocatorNode",
+      "to": "SELF_CORE_MAINLINE",
+      "relationType": "allocates_primary_energy"
+    },
+    {
+      "from": "PortfolioAllocatorNode",
+      "to": "Archetype_B_ReciprocalPartner",
+      "relationType": "allocates_social_energy"
+    },
+    {
+      "from": "PortfolioAllocatorNode",
+      "to": "Archetype_A_BroadSiren",
+      "relationType": "circuit_breaker_stop_loss"
+    }
+  ]
+}

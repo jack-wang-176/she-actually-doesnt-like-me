@@ -1,0 +1,6481 @@
+"""stories-in-wx 回归测试（轻量、自包含、秒级）。
+
+全部使用**合成的临时数据**，不读取任何真实聊天库，因此运行很快、
+不会让磁盘/CPU 长时间满载。
+
+本文件按"发现一个缺陷 → 固化一条回归"的模式追加生长，小节编号即追加
+顺序（中途插入的安全加固小节未编号）。按域大致覆盖：
+命名/CDATA 解析、分片索引与缓存、会话与消息流、导出（8 种格式 + 多格式 +
+zip）、媒体与语音、统计、解密原子性与密钥校验、CLI、日志与脱敏、版本与
+自动更新、数据安全（临时文件唯一、账号冲突、manifest 来源、密钥不落盘、
+更新链 fail-closed、Host 头）、引用/合并转发/表情/位置等消息语义、
+HTML 模板框架、信任边界与参数校验。
+
+运行：
+    python -m unittest discover -s tests -v
+"""
+import hashlib
+import hmac as hmac_mod
+import contextlib
+import io
+import json
+import os
+import re
+import shutil
+import sqlite3
+import struct
+import sys
+import tempfile
+import time
+import unittest
+from unittest import mock
+from contextlib import redirect_stdout
+from pathlib import Path
+
+try:
+    import tomllib            # Python 3.11+；3.10 无标准库 TOML 解析器
+except ModuleNotFoundError:   # pragma: no cover
+    tomllib = None
+
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+# 宿主回归测试必须与"用户装了什么插件"解耦：插件可以（合法地）改写会话列表、
+# 消息形状与导出产物，若参与本套件会让宿主行为断言变得不确定。
+# 故在导入 siwx 之前强制零插件模式；插件自身的测试见 tests/test_plugins.py。
+os.environ["SIWX_NO_PLUGINS"] = "1"
+
+from siwx import api_chat, exporter
+from siwx.exporter import _safe_name
+from tests._base import IsolatedRootCase
+from tests import fixtures as fx
+
+
+# ── 合成数据构造 ────────────────────────────────────────────────
+
+def _msg_table(chat):
+    return "Msg_" + hashlib.md5(chat.encode()).hexdigest()
+
+
+def make_shard(path: Path, chat, texts, start_ts=1_700_000_000,
+               include_images=False, origin=0):
+    """建一个含 Msg_ 表 + Name2Id 的分片库。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    t = _msg_table(chat)
+    conn.execute(f"""CREATE TABLE [{t}] (
+        local_id INTEGER PRIMARY KEY, server_id INTEGER, local_type INTEGER,
+        create_time INTEGER, origin_source INTEGER, real_sender_id INTEGER,
+        message_content BLOB, packed_info_data BLOB)""")
+    conn.execute("CREATE TABLE Name2Id (user_name TEXT)")
+    conn.execute("INSERT INTO Name2Id(rowid, user_name) VALUES (1, ?)", (chat,))
+    for i, txt in enumerate(texts):
+        ts = start_ts + i
+        if include_images and i % 5 == 0:
+            content = ('<msg><img aeskey="x" md5="'
+                       + hashlib.md5(f"img{i}".encode()).hexdigest()
+                       + '"/></msg>').encode("utf-8")
+            ltype = 3
+        else:
+            content = txt.encode("utf-8")
+            ltype = 1
+        conn.execute(f"INSERT INTO [{t}] VALUES (?,?,?,?,?,?,?,?)",
+                     (i + 1, 1000 + i, ltype, ts, origin, 1, content, None))
+    conn.commit()
+    conn.close()
+    return path
+
+
+def make_empty_shard(path: Path):
+    """建一个不含 Msg_ 表的分片（模拟 media_*/fts/resource 等）。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE unrelated (x INTEGER)")
+    conn.commit()
+    conn.close()
+    return path
+
+
+def make_account(root: Path, account=fx.DEMO_SELF, chat=fx.DEMO_IDS[0],
+                 n_texts=12, include_images=False):
+    """构造一个最小可用的解密产物目录。"""
+    acc = root / "output" / account
+    msg_dir = acc / "message"
+    # 两个分片：一个含目标会话，一个不含（验证索引会跳过它）
+    make_shard(msg_dir / "message_0.db", chat,
+               [f"第 {i} 条消息" for i in range(n_texts)],
+               include_images=include_images)
+    make_empty_shard(msg_dir / "media_0.db")
+    make_empty_shard(msg_dir / "message_fts.db")
+
+    (acc / "contact").mkdir(parents=True, exist_ok=True)
+    c = sqlite3.connect(acc / "contact" / "contact.db")
+    c.execute("CREATE TABLE contact (username TEXT, remark TEXT, "
+              "nick_name TEXT, alias TEXT)")
+    c.execute("INSERT INTO contact VALUES (?,?,?,?)", (chat, "联系人B", "", ""))
+    c.commit()
+    c.close()
+
+    (acc / "session").mkdir(parents=True, exist_ok=True)
+    s = sqlite3.connect(acc / "session" / "session.db")
+    s.execute("CREATE TABLE SessionTable (username TEXT, summary TEXT, "
+              "sort_timestamp INTEGER)")
+    s.execute("INSERT INTO SessionTable VALUES (?,?,?)", (chat, "预览", 1_700_000_010))
+    s.commit()
+    s.close()
+    return acc, account, chat
+
+
+class TempRootCase(IsolatedRootCase):
+    """兼容别名：隔离实现统一到 tests/_base.IsolatedRootCase。
+
+    SIWX_ROOT → 临时目录 + 清空 api_chat/paths 缓存 + 零插件。强制零插件的
+    原因：本套件断言宿主默认行为，`unittest discover` 若先跑了
+    tests/test_plugins.py，模块级 registry 单例会残留合成 hook
+    （会话过滤器剔公众号、渲染器改写 kind），必须清空。
+    """
+
+    pass
+
+
+# ── 1. _safe_name ───────────────────────────────────────────────
+
+class TestSafeName(unittest.TestCase):
+
+    def test_keeps_contact_name(self):
+        # 修复前：任何输入都返回 "_"
+        self.assertEqual(_safe_name("群聊A（占位）"), "群聊A（占位）")
+        self.assertEqual(_safe_name("联系人C"), "联系人C")
+        self.assertEqual(_safe_name("文件传输助手"), "文件传输助手")
+
+    def test_replaces_illegal_chars(self):
+        self.assertEqual(_safe_name('a<b>c:d"e/f\\g|h?i*j'), "a_b_c_d_e_f_g_h_i_j")
+
+    def test_strips_and_falls_back(self):
+        self.assertEqual(_safe_name("  带空格  "), "带空格")
+        self.assertEqual(_safe_name("结尾有点..."), "结尾有点")
+        self.assertEqual(_safe_name(""), "chat")
+        self.assertEqual(_safe_name(None), "chat")
+        self.assertEqual(len(_safe_name("x" * 80)), 48)
+
+    def test_windows_reserved(self):
+        self.assertEqual(_safe_name("CON"), "_CON")
+        self.assertEqual(_safe_name("nul.txt"), "_nul.txt")
+
+
+# ── 2. CDATA 解析 ───────────────────────────────────────────────
+
+class TestCdata(unittest.TestCase):
+
+    def test_cdata_content_is_preserved(self):
+        """修复前 CDATA 会被替换成一个 0x01 控制字符。"""
+        got = api_chat._xml_text("<![CDATA[标题内容]]>")
+        self.assertEqual(got, "标题内容")
+        self.assertNotIn("\x01", got or "")
+
+    def test_appmsg_title_from_cdata(self):
+        xml = ('<appmsg><title><![CDATA[一个链接标题]]></title>'
+               '<url><![CDATA[https://example.com/x]]></url></appmsg>')
+        title, url, _des = api_chat._parse_appmsg(xml)
+        self.assertEqual(title, "一个链接标题")
+        self.assertEqual(url, "https://example.com/x")
+
+
+# ── 3. 分片索引 ─────────────────────────────────────────────────
+
+class TestShardIndex(TempRootCase):
+
+    def test_index_finds_only_real_shards(self):
+        acc, _account, chat = make_account(self.tmp, n_texts=3)
+        shards = api_chat.shards_for(acc, chat)
+        self.assertEqual([p.name for p in shards], ["message_0.db"])
+        # 不含 Msg_ 表的库不应出现在索引里
+        idx = api_chat.shard_index(acc / "message")
+        self.assertNotIn("media_0.db", [p.name for ps in idx.values() for p in ps])
+
+    def test_unknown_chat_returns_empty(self):
+        acc, _account, _chat = make_account(self.tmp)
+        self.assertEqual(api_chat.shards_for(acc, "wxid_nobody"), [])
+
+    def test_index_is_cached(self):
+        acc, _account, chat = make_account(self.tmp)
+        api_chat.shards_for(acc, chat)
+        first = api_chat.shard_index(acc / "message")
+        second = api_chat.shard_index(acc / "message")
+        self.assertIs(first, second, "第二次调用应命中缓存（同一对象）")
+
+    def test_message_tables_by_shard(self):
+        acc, _account, chat = make_account(self.tmp)
+        by_shard = api_chat.message_tables_by_shard(acc)
+        only = acc / "message" / "message_0.db"
+        self.assertEqual(len(by_shard), 1)
+        self.assertIn(only, by_shard)
+        self.assertEqual(by_shard[only], [_msg_table(chat)])
+
+
+# ── 4. message_stream / count_messages ──────────────────────────
+
+class TestSessionsApi(TempRootCase):
+
+    def test_filters_ghost_sessions_and_marks_official_accounts(self):
+        acc, account, chat = make_account(self.tmp, n_texts=3)
+        sdb = acc / "session" / "session.db"
+        conn = sqlite3.connect(sdb)
+        conn.executemany("INSERT INTO SessionTable VALUES (?,?,?)", [
+            ("gh_live", "公众号摘要", 1_700_000_100),
+            ("gh_empty", "", 0),
+            ("brandsessionholder", "聚合入口", 1_700_000_200),
+            ("@placeholder_foldgroup", "占位入口", 1_700_000_201),
+        ])
+        conn.commit(); conn.close()
+        cdb = acc / "contact" / "contact.db"
+        conn = sqlite3.connect(cdb)
+        conn.execute("INSERT INTO contact VALUES (?,?,?,?)",
+                     ("gh_live", "公众号A", "", ""))
+        conn.commit(); conn.close()
+
+        from siwx.server import app
+        data = app.test_client().get(f"/api/chat/sessions?account={account}").get_json()
+        usernames = {s["username"]: s for s in data["sessions"]}
+        self.assertIn(chat, usernames)
+        self.assertIn("gh_live", usernames)
+        self.assertTrue(usernames["gh_live"]["is_official"])
+        self.assertEqual(usernames["gh_live"]["kind"], "official")
+        self.assertEqual(usernames["gh_live"]["display"], "公众号A")
+        self.assertNotIn("gh_empty", usernames)
+        self.assertNotIn("brandsessionholder", usernames)
+        self.assertNotIn("@placeholder_foldgroup", usernames)
+
+    def test_sessions_api_uses_cache_after_first_call(self):
+        acc, account, _chat = make_account(self.tmp, n_texts=3)
+        from siwx.server import app
+        client = app.test_client()
+        self.assertEqual(client.get(f"/api/chat/sessions?account={account}").status_code, 200)
+
+        opened = []
+        real_connect = sqlite3.connect
+        def spy(path, *a, **k):
+            opened.append(Path(path).name)
+            return real_connect(path, *a, **k)
+        sqlite3.connect = spy
+        try:
+            r = client.get(f"/api/chat/sessions?account={account}")
+        finally:
+            sqlite3.connect = real_connect
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(opened, [], "会话列表缓存命中时不应再打开 contact/session 数据库")
+
+
+class TestMessageStream(TempRootCase):
+
+    def test_stream_yields_all_in_order(self):
+        acc, account, chat = make_account(self.tmp, n_texts=12)
+        from siwx.export_stream import message_stream
+        msgs = list(message_stream(acc, chat, account=account))
+        self.assertEqual(len(msgs), 12)
+        ts = [m["createTime"] for m in msgs]
+        self.assertEqual(ts, sorted(ts), "必须按时间正序")
+        self.assertEqual(msgs[0]["content"], "第 0 条消息")
+        self.assertEqual(msgs[0]["senderDisplayName"], "联系人B")
+
+    def test_count_matches_stream(self):
+        acc, account, chat = make_account(self.tmp, n_texts=7)
+        from siwx.export_stream import count_messages, message_stream
+        self.assertEqual(count_messages(acc, chat),
+                         len(list(message_stream(acc, chat, account=account))))
+
+    def test_shard_scan_is_avoided(self):
+        """索引建好之后，不含 Msg_ 表的库不应再被打开。
+
+        索引本身需要扫一遍目录（这是必要的一次性成本）；收益体现在后续调用：
+        每个会话的两遍导出、多会话批量、聊天页都直接命中缓存。
+        """
+        acc, account, chat = make_account(self.tmp, n_texts=3)
+        from siwx.export_stream import message_stream
+
+        # 预热：第一次会扫全部 *.db 建立索引
+        list(message_stream(acc, chat, account=account))
+
+        opened = []
+        real_connect = sqlite3.connect
+
+        def spy(path, *a, **k):
+            opened.append(Path(path).name)
+            return real_connect(path, *a, **k)
+
+        sqlite3.connect = spy
+        try:
+            list(message_stream(acc, chat, account=account))
+        finally:
+            sqlite3.connect = real_connect
+
+        self.assertNotIn("media_0.db", opened, "索引未生效：仍在打开无关分片")
+        self.assertNotIn("message_fts.db", opened, "索引未生效：仍在打开无关分片")
+        self.assertIn("message_0.db", opened)
+
+    def test_index_survives_dir_change(self):
+        """目录内容变化后索引应自动失效并重建。
+
+        签名含文件名集合（_dir_signature: (name, size, mtime_ns)），
+        新增分片必然改变签名，无需等待 mtime 推进。
+        """
+        acc, account, chat = make_account(self.tmp, n_texts=3)
+        self.assertEqual(len(api_chat.shards_for(acc, chat)), 1)
+        make_shard(acc / "message" / "message_1.db", chat, ["后加的"])
+        self.assertEqual(len(api_chat.shards_for(acc, chat)), 2)
+
+
+# ── 5. 导出：命名、HTML、JSON 干净性 ────────────────────────────
+
+class TestExport(TempRootCase):
+
+    def _export(self, fmt, **kw):
+        acc, account, chat = self.acc, self.account, self.chat
+        return exporter.run_export(
+            acc, account, chat, self.display, fmt,
+            want_messages=True, want_media=kw.pop("media", False),
+            want_avatars=kw.pop("avatars", False),
+            export_root=self.tmp / "exports", pack="none",
+            progress=lambda p, m: None)
+
+    def setUp(self):
+        super().setUp()
+        self.acc, self.account, self.chat = make_account(self.tmp, n_texts=12)
+        self.display = "测试会话名ABC"
+
+    def test_all_formats_embed_display_name(self):
+        for fmt in ("json", "html", "txt", "csv", "markdown",
+                    "toml", "sqlite", "xlsx"):
+            with self.subTest(fmt=fmt):
+                res = self._export(fmt)
+                self.assertIn(self.display, Path(res["export_dir"]).name)
+                self.assertIn(self.display, Path(res["file"]).name)
+                self.assertTrue(Path(res["file"]).is_file())
+                self.assertEqual(res["message_count"], 12)
+
+    def test_html_export_not_broken(self):
+        """修复前会抛 KeyError: 'displayName'。"""
+        res = self._export("html")
+        html = Path(res["file"]).read_text(encoding="utf-8")
+        self.assertIn("window.CHAT_DATA", html)
+        i = html.index("window.CHAT_DATA = ") + len("window.CHAT_DATA = ")
+        data, _ = json.JSONDecoder().raw_decode(html[i:])
+        meta = data["meta"]
+        self.assertEqual(meta["sessionName"], self.display)
+        self.assertEqual(meta["sessionId"], self.chat)
+        self.assertGreater(meta["dateRange"]["start"], 0)
+        self.assertGreater(meta["dateRange"]["end"], 0)
+        self.assertEqual(meta["messageCount"], len(data["messages"]))
+
+    def test_json_session_has_no_internal_keys(self):
+        res = self._export("json")
+        d = json.loads(Path(res["file"]).read_text(encoding="utf-8"))
+        self.assertNotIn("_avatar_map", d["session"])
+        for k in d["session"]:
+            self.assertFalse(k.startswith("_"), f"内部键泄漏: {k}")
+
+    def test_toml_export_is_parseable(self):
+        """P1-4：旧实现把 bool 拼成 Python 的 True/False，tomllib 直接报错。"""
+        if tomllib is None:
+            self.skipTest("tomllib 需要 Python 3.11+")
+        res = self._export("toml")
+        data = tomllib.loads(Path(res["file"]).read_text(encoding="utf-8"))
+        self.assertIs(data["session"]["isGroup"], False)
+        self.assertEqual(data["session"]["messageCount"], 12)
+        self.assertEqual(len(data["messages"]), 12)
+        for msg in data["messages"]:
+            self.assertIsInstance(msg["isSend"], int)
+            self.assertIsInstance(msg["localId"], int)
+            self.assertIn("第 ", msg["content"])
+        self.assertIn("第 0 条消息", [m["content"] for m in data["messages"]])
+
+    def test_toml_group_session_keeps_boolean_type(self):
+        """群聊 isGroup=true 必须是 TOML 布尔，而不是被序列化成字符串。"""
+        if tomllib is None:
+            self.skipTest("tomllib 需要 Python 3.11+")
+        acc, account, chat = make_account(
+            self.tmp / "group_root", chat=fx.DEMO_GROUP_IDS[0], n_texts=3)
+        res = exporter.run_export(
+            acc, account, chat, "群聊A", "toml",
+            want_messages=True, want_media=False, want_avatars=False,
+            export_root=self.tmp / "toml_group", pack="none")
+        data = tomllib.loads(Path(res["file"]).read_text(encoding="utf-8"))
+        self.assertIs(data["session"]["isGroup"], True)
+        self.assertEqual(len(data["messages"]), 3)
+        self.assertTrue(all(isinstance(m["isSend"], int)
+                            for m in data["messages"]))
+
+    def test_multi_export_creates_separate_dirs(self):
+        """修复前所有会话都写进同一个 "_" 目录。"""
+        acc, account, chat = self.acc, self.account, self.chat
+        res = exporter.run_export_multi(
+            acc, account,
+            [{"chat": chat, "display": "会话甲"}, {"chat": chat, "display": "会话乙"}],
+            fmt="json", want_media=False, want_avatars=False,
+            export_root=self.tmp / "multi", pack="folder")
+        self.assertEqual(res["ok_count"], 2)
+        names = sorted(p.name for p in Path(res["total_dir"]).iterdir() if p.is_dir())
+        self.assertEqual(len(names), 2, f"目录未按会话隔离: {names}")
+
+    def test_multi_format_export_writes_all_files(self):
+        """fmt 传列表时应一次写出多种格式，统计与清单口径不翻倍。"""
+        res = self._export(["json", "html"])
+        files = [Path(f) for f in res["files"]]
+        self.assertEqual([f.suffix for f in files], [".json", ".html"])
+        for f in files:
+            self.assertTrue(f.is_file(), f"缺产物: {f}")
+        # P2-1：message_count 是单遍逻辑条数（12），不是两种格式之和；
+        # 实际写入总量另由 written_total 给出（24）
+        self.assertEqual(res["message_count"], 12)
+        self.assertEqual(res["written_total"], 24)
+        manifest = json.loads(
+            (Path(res["export_dir"]) / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(manifest["files"]), 2)
+        self.assertEqual(manifest["collected_count"], 12)
+        self.assertEqual(manifest["written_count"], 12)
+        self.assertEqual(manifest["written_total"], 24)
+        # 解析统计按消息数计（12 条），不随格式数翻倍
+        self.assertEqual(sum(manifest["parse"]["type_counts"].values()), 12)
+
+    def test_multi_format_via_run_export_multi(self):
+        """run_export_multi 透传格式列表。"""
+        acc, account, chat = self.acc, self.account, self.chat
+        res = exporter.run_export_multi(
+            acc, account, [{"chat": chat, "display": self.display}],
+            fmt=["json", "txt"], want_media=False, want_avatars=False,
+            export_root=self.tmp / "multi_fmt", pack="folder")
+        self.assertEqual(res["ok_count"], 1)
+        sess = res["sessions"][0]
+        self.assertEqual(len(sess["files"]), 2)
+        self.assertTrue(all(Path(f).is_file() for f in sess["files"]))
+        # P2-1：多格式聚合也按单遍条数计，不随格式数翻倍
+        self.assertEqual(sess["message_count"], 12)
+        self.assertEqual(res["message_count"], 12)
+
+    def test_multi_report_includes_size_duration_and_zip_size(self):
+        """报告逐会话带产物大小与耗时；整体 zip 带大小（前端结果面板展示用）。"""
+        acc, account, chat = self.acc, self.account, self.chat
+        res = exporter.run_export_multi(
+            acc, account, [{"chat": chat, "display": self.display}],
+            fmt="json", want_media=False, want_avatars=False,
+            export_root=self.tmp / "multi_report", pack="single")
+        sess = res["sessions"][0]
+        self.assertGreater(sess["size_bytes"], 0)
+        self.assertGreaterEqual(sess["duration_ms"], 0)
+        self.assertTrue(res["zip"])
+        self.assertGreater(res["zip_size"], 0)
+
+
+class TestExportWantMessagesOff(TempRootCase):
+    """P2-3 回归：want_messages=False（UI 取消"消息记录"）时不能只透传——
+    8 种格式都不得写出消息正文，但仍要生成可用的产物（文件头/表结构/
+    成员表）与会话元数据，计数口径与 P2-1 的单遍条数一致（0）。"""
+
+    def setUp(self):
+        super().setUp()
+        self.acc, self.account, self.chat = make_account(self.tmp, n_texts=6)
+        self.display = "测试会话名ABC"
+
+    def _export(self, fmt):
+        return exporter.run_export(
+            self.acc, self.account, self.chat, self.display, fmt,
+            want_messages=False, want_media=False, want_avatars=False,
+            export_root=self.tmp / "exports", pack="none",
+            progress=lambda p, m: None)
+
+    def test_json_messages_empty_and_counts_zero(self):
+        res = self._export("json")
+        self.assertEqual(res["message_count"], 0)
+        self.assertEqual(res["written_total"], 0)
+        d = json.loads(Path(res["file"]).read_text(encoding="utf-8"))
+        self.assertEqual(d["messages"], [])
+        self.assertEqual(d["session"]["messageCount"], 0)
+        manifest = json.loads(
+            (Path(res["export_dir"]) / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["written_count"], 0)
+        self.assertEqual(manifest["written_total"], 0)
+        self.assertEqual(manifest["collected_count"], 6)
+
+    def test_html_keeps_frame_but_no_message_body(self):
+        """非流式格式（HTML）仍写头/尾/成员表，只是没有消息。"""
+        res = self._export("html")
+        html = Path(res["file"]).read_text(encoding="utf-8")
+        blob = html.split("window.CHAT_DATA = ", 1)[1].split(";</script>", 1)[0]
+        data = json.loads(blob)
+        self.assertEqual(data["messages"], [])
+        self.assertEqual(data["meta"]["messageCount"], 0)
+        self.assertTrue(data["members"], "成员表应仍由第一遍 senders 生成")
+        self.assertIn("const MSG_COUNT = 0;", html)
+        self.assertNotIn("第 0 条消息", html)
+
+    def test_toml_parseable_without_messages(self):
+        if tomllib is None:
+            self.skipTest("tomllib 需要 Python 3.11+")
+        res = self._export("toml")
+        text = Path(res["file"]).read_text(encoding="utf-8")
+        data = tomllib.loads(text)
+        self.assertEqual(data["session"]["messageCount"], 0)
+        self.assertNotIn("messages", data)
+        self.assertNotIn("第 0 条消息", text)
+
+    def test_all_formats_write_file_with_zero_count(self):
+        for fmt in ("json", "html", "txt", "csv", "markdown", "toml",
+                    "sqlite", "xlsx"):
+            with self.subTest(fmt=fmt):
+                res = self._export(fmt)
+                self.assertEqual(res["message_count"], 0)
+                self.assertTrue(Path(res["file"]).is_file(), f"缺产物: {fmt}")
+
+    def test_sqlite_keeps_schema_without_rows(self):
+        res = self._export("sqlite")
+        conn = sqlite3.connect(res["file"])
+        try:
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0], 0)
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM session").fetchone()[0], 1)
+        finally:
+            conn.close()
+
+    def test_xlsx_keeps_header_only(self):
+        from openpyxl import load_workbook
+        res = self._export("xlsx")
+        wb = load_workbook(res["file"], read_only=True)
+        try:
+            rows = list(wb.active.iter_rows(values_only=True))
+        finally:
+            wb.close()
+        # write_only 产物没有 dimension，max_row 为 None，按实际行数断言
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][:3], ("localId", "时间", "类型"))
+
+
+# ── 4.1 /api/job 结构化进度 ─────────────────────────────────────
+
+class TestJobProgressApi(TempRootCase):
+    """/api/job 除日志外还暴露结构化 progress 字段，前端不再从日志
+    文本里正则抠百分比（日志归日志、进度归进度）。"""
+
+    def test_job_status_includes_progress_field(self):
+        from siwx.server import app, _job
+        _job.update({"progress": {"pct": 42, "msg": "[2/5] 解密图片…"}})
+        try:
+            d = app.test_client().get("/api/job").get_json()
+        finally:
+            _job.update({"progress": {"pct": 0, "msg": ""}})
+        self.assertEqual(d["progress"]["pct"], 42)
+        self.assertEqual(d["progress"]["msg"], "[2/5] 解密图片…")
+
+    def test_job_progress_defaults_when_missing(self):
+        """老状态残留缺 progress 键时兜底返回零进度，前端拿到的形状恒定。"""
+        from siwx.server import app, _job
+        saved = _job.pop("progress", None)
+        try:
+            d = app.test_client().get("/api/job").get_json()
+        finally:
+            if saved is not None:
+                _job["progress"] = saved
+        self.assertEqual(d["progress"], {"pct": 0, "msg": ""})
+
+
+# ── 5.1 动画表情导出：CDN 下载兜底 + 渲染器 XML 实体解码 ─────────
+
+class TestStickerExport(TempRootCase):
+    """47 消息本地缓存解不开（微信私有封装），导出端按 cdnurl 下载兜底；
+    渲染器侧 raw XML 的 &amp; 必须解码，否则表情 URL 带 &amp; 请求 → 400。"""
+
+    GIF = b"GIF89a" + b"\x00" * 16
+
+    def test_collect_metadata_gathers_sticker_urls(self):
+        acc, account, chat = make_account(self.tmp, n_texts=1)
+        db = acc / "message" / "message_0.db"
+        conn = sqlite3.connect(db)
+        raw = ('<msg><emoji md5="a" cdnurl="http://wxapp.tc.qq.com/x?m=1&amp;filekey=2" '
+               'width="240" height="240" /></msg>').encode("utf-8")
+        conn.execute("INSERT INTO " + _msg_table(chat) +
+                     " VALUES (13, 1013, 47, 1700000012, 0, 1, ?, NULL)", (raw,))
+        conn.commit(); conn.close()
+        from siwx.exporter import _collect_metadata
+        res = _collect_metadata(acc, chat, None, None, account, None)
+        stickers = res[6]
+        self.assertEqual(len(stickers), 1)
+        md5, bm, lid, ts, url = stickers[0]
+        self.assertEqual((lid, ts), (13, 1700000012))
+        # Python 端解析已把 &amp; 还原为 &；渲染器侧同样要解码（模板已含 xmlDec）
+        self.assertEqual(url, "http://wxapp.tc.qq.com/x?m=1&filekey=2")
+
+    def test_sticker_download_fallback(self):
+        from siwx.exporter import _export_sticker_media, _media_key
+        stickers = [
+            ("a" * 32, "", 1, 1700000001, "http://wxapp.tc.qq.com/s1"),
+            ("b" * 32, "", 2, 1700000002, "http://wxapp.tc.qq.com/s2"),
+            ("c" * 32, "", 3, 1700000003, "http://evil.example.com/s3"),
+        ]
+        media_map = {_media_key("b" * 32, "", 2, 1700000002): "media/already.jpg"}
+
+        def fake_fetch(spec, timeout=None, **kw):
+            self.assertEqual(spec["url"], "http://wxapp.tc.qq.com/s1")
+            return {"ok": True, "data": self.GIF, "ext": "gif"}
+
+        dest = self.tmp / "media"
+        with mock.patch.object(exporter.sns_cdn, "fetch_emoji", fake_fetch):
+            ok = _export_sticker_media(dest, stickers, media_map)
+        self.assertEqual(ok, 1)
+        f = dest / ("emoji_0000_" + "a" * 12 + ".gif")
+        self.assertTrue(f.is_file())
+        self.assertEqual(f.read_bytes(), self.GIF)
+        # 白名单外域名跳过、已有媒体的跳过
+        self.assertEqual(len(list(dest.iterdir())), 1)
+        self.assertNotIn(_media_key("c" * 32, "", 3, 1700000003), media_map)
+
+    def test_sticker_download_failure_recorded(self):
+        from siwx.exporter import _export_sticker_media
+        stickers = [("d" * 32, "", 4, 1700000004, "http://wxapp.tc.qq.com/s4")]
+        with mock.patch.object(exporter.sns_cdn, "fetch_emoji",
+                               lambda spec, **kw: {"ok": False, "error": "下载失败"}):
+            ok = _export_sticker_media(self.tmp / "media", stickers, {})
+        self.assertEqual(ok, 0)
+        self.assertFalse((self.tmp / "media").exists() and
+                         any((self.tmp / "media").iterdir()))
+
+    def test_renderer_decodes_xml_entities(self):
+        """渲染器 xmlAttr/xmlVal 必须解码实体并容忍 'attr = value' 空格格式。"""
+        tpl = (Path("siwx") / "templates" / "default" / "renderer.js") \
+            .read_text(encoding="utf-8")
+        self.assertIn("function xmlDec", tpl)
+        self.assertIn("\\\\s*=\\\\s*", tpl)
+        self.assertIn("xmlDec(m[1])", tpl)
+
+
+# ── 6. 媒体：扩展名 + chat/ts 透传 ──────────────────────────────
+
+class TestVoiceMedia(TempRootCase):
+
+    def test_parse_voice_meta_and_read_silk_blob(self):
+        from siwx import voice
+        acc, account, chat = make_account(self.tmp, n_texts=1)
+        db = acc / "message" / "media_0.db"
+        conn = sqlite3.connect(db)
+        conn.execute("DROP TABLE unrelated")
+        conn.execute("CREATE TABLE Name2Id (user_name TEXT)")
+        conn.execute("INSERT INTO Name2Id(rowid, user_name) VALUES (1, ?)", (chat,))
+        conn.execute("CREATE TABLE VoiceInfo (chat_name_id INTEGER, create_time INTEGER, "
+                     "local_id INTEGER, svr_id INTEGER, voice_data BLOB, data_index TEXT)")
+        raw = b"\x02#!SILK_V3\x00\x01voice"
+        conn.execute("INSERT INTO VoiceInfo VALUES (?,?,?,?,?,?)",
+                     (1, 1700000000, 9, 123456789, raw, "0"))
+        conn.commit(); conn.close()
+        meta = voice.parse_voice_meta('<msg><voicemsg voicelength="2429" length="3990" voiceformat="4" /></msg>')
+        self.assertEqual(meta["durationMs"], 2429)
+        body, info = voice.get_voice(acc, chat=chat, local_id=9, svr_id=123456789, ts=1700000000)
+        self.assertEqual(body, b"#!SILK_V3\x00\x01voice")
+        self.assertEqual(info["silkOffset"], 1)
+
+    def test_voice_api_serves_silk(self):
+        acc, account, chat = make_account(self.tmp, n_texts=1)
+        db = acc / "message" / "media_0.db"
+        conn = sqlite3.connect(db)
+        conn.execute("DROP TABLE unrelated")
+        conn.execute("CREATE TABLE Name2Id (user_name TEXT)")
+        conn.execute("INSERT INTO Name2Id(rowid, user_name) VALUES (1, ?)", (chat,))
+        conn.execute("CREATE TABLE VoiceInfo (chat_name_id INTEGER, create_time INTEGER, "
+                     "local_id INTEGER, svr_id INTEGER, voice_data BLOB, data_index TEXT)")
+        conn.execute("INSERT INTO VoiceInfo VALUES (?,?,?,?,?,?)",
+                     (1, 1700000000, 9, 123456789, b"\x02#!SILK_V3abc", "0"))
+        conn.commit(); conn.close()
+        from siwx.server import app
+        r = app.test_client().get(
+            f"/api/chat/media/voice?account={account}&chat={chat}&local_id=9&svr_id=123456789&ts=1700000000")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.data, b"#!SILK_V3abc")
+        self.assertEqual(r.headers.get("X-SIWX-Voice-Format"), "silk")
+
+    def test_pcm_to_wav_uses_stdlib_container(self):
+        from siwx import voice
+        wav = voice.pcm_to_wav(b"\x00\x00\x01\x00", sample_rate=24000)
+        self.assertTrue(wav.startswith(b"RIFF"))
+        self.assertIn(b"WAVE", wav[:16])
+        self.assertGreater(len(wav), 44)
+
+    def test_transcode_prefers_pilk_backend(self):
+        from siwx import voice
+        seen = []
+        old_pilk = voice._decode_silk_to_pcm_with_pilk
+        old_cmd = voice._decode_silk_to_pcm_with_command
+        try:
+            voice._decode_silk_to_pcm_with_pilk = lambda data: (seen.append("pilk") or b"\x00\x00", "", "pilk")
+            voice._decode_silk_to_pcm_with_command = lambda data, rate: (seen.append("cmd") or b"\x01\x00", "", "cmd")
+            body, meta = voice.transcode_voice(b"#!SILK_V3abc", "wav")
+        finally:
+            voice._decode_silk_to_pcm_with_pilk = old_pilk
+            voice._decode_silk_to_pcm_with_command = old_cmd
+        self.assertEqual(seen, ["pilk"])
+        self.assertTrue(body.startswith(b"RIFF"))
+        self.assertEqual(meta["engine"], "pilk")
+
+    def test_bundled_decoder_path_is_available_as_fallback(self):
+        from siwx import voice
+        vendor = self.tmp / "siwx" / "vendor" / "silk-decoder" / "windows"
+        vendor.mkdir(parents=True, exist_ok=True)
+        exe = vendor / ("silk_v3_decoder.exe" if os.name == "nt" else "silk_v3_decoder")
+        exe.write_bytes(b"fake")
+        old_roots = voice._resource_roots
+        try:
+            voice._resource_roots = lambda: [self.tmp / "siwx"]
+            candidates = voice._decoder_candidates()
+        finally:
+            voice._resource_roots = old_roots
+        self.assertTrue(candidates)
+        self.assertEqual(candidates[0][1], [str(exe)])
+        self.assertTrue(candidates[0][0].startswith("bundled:"))
+
+    def test_voice_api_transcodes_wav_when_decoder_available(self):
+        acc, account, chat = make_account(self.tmp, n_texts=1)
+        db = acc / "message" / "media_0.db"
+        conn = sqlite3.connect(db)
+        conn.execute("DROP TABLE unrelated")
+        conn.execute("CREATE TABLE Name2Id (user_name TEXT)")
+        conn.execute("INSERT INTO Name2Id(rowid, user_name) VALUES (1, ?)", (chat,))
+        conn.execute("CREATE TABLE VoiceInfo (chat_name_id INTEGER, create_time INTEGER, "
+                     "local_id INTEGER, svr_id INTEGER, voice_data BLOB, data_index TEXT)")
+        conn.execute("INSERT INTO VoiceInfo VALUES (?,?,?,?,?,?)",
+                     (1, 1700000000, 9, 123456789, b"\x02#!SILK_V3abc", "0"))
+        conn.commit(); conn.close()
+        from siwx import voice
+        from siwx.server import app
+        old = voice.transcode_voice
+        try:
+            voice.transcode_voice = lambda data, target="wav": (
+                b"RIFFxxxxWAVEfmt ", {"format": "wav", "mimetype": "audio/wav", "ext": "wav", "engine": "fake"})
+            r = app.test_client().get(
+                f"/api/chat/media/voice?account={account}&chat={chat}&local_id=9&svr_id=123456789&ts=1700000000&format=wav")
+        finally:
+            voice.transcode_voice = old
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.mimetype, "audio/wav")
+        self.assertEqual(r.headers.get("X-SIWX-Voice-Format"), "wav")
+        self.assertEqual(r.headers.get("X-SIWX-Voice-Transcoder"), "fake")
+
+    def test_voice_never_crosses_chat_when_name2id_missing_in_shard(self):
+        """回归 #40：会话在某分片的 Name2Id 里缺席时，不得用裸 local_id
+        把别的会话的语音串进来。
+
+        场景：好友的语音都在 media_1（她的名字只在 media_1 的 Name2Id 里），
+        media_0 里只有别人的语音、且 local_id 撞号（VoiceInfo 的 local_id 是
+        每会话独立编号，跨会话撞号是常态）。修复前 media_0 的裸
+        ``local_id=?`` 降级查询首中即返回，别人的语音被当成好友的。"""
+        from siwx import voice
+        acc, account, chat = make_account(self.tmp, n_texts=1)
+        other = "wxid_demo_b"
+
+        def _voice_db(path, name2id, rows):
+            conn = sqlite3.connect(path)
+            conn.execute("DROP TABLE IF EXISTS unrelated")
+            conn.execute("CREATE TABLE Name2Id (user_name TEXT)")
+            for rid, name in name2id:
+                conn.execute("INSERT INTO Name2Id(rowid, user_name) VALUES (?,?)", (rid, name))
+            conn.execute("CREATE TABLE VoiceInfo (chat_name_id INTEGER, create_time INTEGER, "
+                         "local_id INTEGER, svr_id INTEGER, voice_data BLOB, data_index TEXT)")
+            for r in rows:
+                conn.execute("INSERT INTO VoiceInfo VALUES (?,?,?,?,?,?)", r)
+            conn.commit()
+            conn.close()
+
+        silk_other = b"\x02#!SILK_V3other-chat-voice"
+        silk_mine = b"\x02#!SILK_V3my-voice"
+        # media_0：只有 wxid_demo_b 的语音，local_id=9 与好友撞号，同秒
+        _voice_db(acc / "message" / "media_0.db", [(1, other)],
+                  [(1, 1700000000, 9, 777, silk_other, "0")])
+        # media_1：好友的语音（Name2Id rowid 恰好也是 1——分片间本就各自编号）
+        _voice_db(acc / "message" / "media_1.db", [(1, chat)],
+                  [(1, 1700000000, 9, 888, silk_mine, "0")])
+
+        body, info = voice.get_voice(acc, chat=chat, local_id=9,
+                                     svr_id=888, ts=1700000000)
+        self.assertEqual(body, b"#!SILK_V3my-voice", info)
+
+        # 无 svr_id：同样不允许串音，应正确命中好友自己的那条
+        body, info = voice.get_voice(acc, chat=chat, local_id=9,
+                                     svr_id=0, ts=1700000000)
+        self.assertEqual(body, b"#!SILK_V3my-voice", info)
+
+        # 请求方拿不出 svr_id 且本会话没有这条语音时，宁可未命中也不串音
+        body, info = voice.get_voice(acc, chat=chat, local_id=99,
+                                     svr_id=0, ts=1700000000)
+        self.assertIsNone(body)
+
+    def test_voice_unscoped_query_trusts_svr_id_only(self):
+        """会话未知（chat 为空）时只允许 svr_id 精确命中；裸 local_id 一律禁用。"""
+        from siwx import voice
+        acc, account, chat = make_account(self.tmp, n_texts=1)
+        db = acc / "message" / "media_0.db"
+        conn = sqlite3.connect(db)
+        conn.execute("DROP TABLE unrelated")
+        conn.execute("CREATE TABLE Name2Id (user_name TEXT)")
+        conn.execute("INSERT INTO Name2Id(rowid, user_name) VALUES (1, 'wxid_demo_b')")
+        conn.execute("CREATE TABLE VoiceInfo (chat_name_id INTEGER, create_time INTEGER, "
+                     "local_id INTEGER, svr_id INTEGER, voice_data BLOB, data_index TEXT)")
+        conn.execute("INSERT INTO VoiceInfo VALUES (?,?,?,?,?,?)",
+                     (1, 1700000000, 9, 777, b"\x02#!SILK_V3other", "0"))
+        conn.commit()
+        conn.close()
+        # svr_id 精确命中（会话未知也允许）
+        body, _ = voice.get_voice(acc, chat="", local_id=0, svr_id=777, ts=1700000000)
+        self.assertEqual(body, b"#!SILK_V3other")
+        # 同 local_id 同 ts 但 svr_id 不符：宁可未命中，不返回别人的语音
+        body, _ = voice.get_voice(acc, chat="", local_id=9, svr_id=0, ts=1700000000)
+        self.assertIsNone(body)
+
+
+class TestMediaExport(TempRootCase):
+
+    def setUp(self):
+        super().setUp()
+        self.acc, self.account, self.chat = make_account(self.tmp, n_texts=6)
+
+    def test_extension_follows_actual_content(self):
+        """修复前 media 引用恒为 .jpg，即使实际写的是 .png。"""
+        from siwx import exporter as ex
+
+        def fake_get_image(account, md5, acc_dir, **kw):
+            return b"\x89PNG\r\n\x1a\n" + b"\x00" * 32, "image/png"
+
+        old = ex.media.get_image
+        ex.media.get_image = fake_get_image
+        try:
+            dest = self.tmp / "media_out"
+            dest.mkdir(parents=True, exist_ok=True)
+            out, reason = ex._try_decrypt(str(self.acc), self.account, self.chat,
+                                          "a" * 32, None, 1, 1_700_000_000,
+                                          dest / "0000_aaaaaaaaaaaa.jpg")
+            self.assertIsNotNone(out)
+            self.assertEqual(reason, "")
+            self.assertEqual(out.suffix, ".png")
+            self.assertTrue(out.is_file())
+            self.assertEqual(out.name, "0000_aaaaaaaaaaaa.png")
+        finally:
+            ex.media.get_image = old
+
+    def test_webp_keeps_its_own_extension(self):
+        """PR #28 同族缺陷：按子串猜扩展名（"png" in info）会把 image/webp
+        写成 .jpg。扩展名必须取自 ctype 子类型。"""
+        from siwx import exporter as ex
+
+        old = ex.media.get_image
+        ex.media.get_image = lambda *a, **kw: (b"RIFF" + b"\x00" * 32,
+                                               "image/webp")
+        try:
+            out, reason = ex._try_decrypt(str(self.acc), self.account, self.chat,
+                                          "a" * 32, None, 1, 1_700_000_000,
+                                          self.tmp / "0000_aaaaaaaaaaaa.jpg")
+            self.assertIsNotNone(out)
+            self.assertEqual(out.suffix, ".webp")
+        finally:
+            ex.media.get_image = old
+
+    def test_unknown_ctype_fails_explicitly(self):
+        """无法识别的 ctype 显式失败，不静默落成 .jpg。"""
+        from siwx import exporter as ex
+
+        old = ex.media.get_image
+        ex.media.get_image = lambda *a, **kw: (b"\x00" * 32, "application/json")
+        try:
+            out, reason = ex._try_decrypt(str(self.acc), self.account, self.chat,
+                                          "a" * 32, None, 1, 1_700_000_000,
+                                          self.tmp / "0000_aaaaaaaaaaaa.jpg")
+            self.assertIsNone(out)
+            self.assertIn("未知媒体类型", reason)
+        finally:
+            ex.media.get_image = old
+
+    def test_chat_and_ts_are_forwarded(self):
+        """修复前未传 chat/ts，attach/Bubble/Thumb 三级来源全部失效。"""
+        from siwx import exporter as ex
+        seen = {}
+
+        def fake_get_image(account, md5, acc_dir, **kw):
+            seen.update(kw)
+            return None, "nope"
+
+        old = ex.media.get_image
+        ex.media.get_image = fake_get_image
+        try:
+            ex._try_decrypt(str(self.acc), self.account, self.chat,
+                            "b" * 32, "c" * 32, 42, 1_700_000_123,
+                            self.tmp / "x.jpg")
+        finally:
+            ex.media.get_image = old
+        self.assertEqual(seen.get("chat"), self.chat)
+        self.assertEqual(seen.get("ts"), 1_700_000_123)
+        self.assertEqual(seen.get("local_id"), 42)
+        self.assertEqual(seen.get("bubble_md5"), "c" * 32)
+
+    def _add_voice_message(self, local_id=99, svr_id=123456789, ts=1_700_000_099):
+        t = _msg_table(self.chat)
+        conn = sqlite3.connect(self.acc / "message" / "message_0.db")
+        conn.execute(f"INSERT INTO [{t}] VALUES (?,?,?,?,?,?,?,?)",
+                     (local_id, svr_id, 34, ts, 0, 1,
+                      b'<msg><voicemsg voicelength="1000" length="12" /></msg>', None))
+        conn.commit(); conn.close()
+
+        db = self.acc / "message" / "media_0.db"
+        conn = sqlite3.connect(db)
+        conn.execute("DROP TABLE unrelated")
+        conn.execute("CREATE TABLE Name2Id (user_name TEXT)")
+        conn.execute("INSERT INTO Name2Id(rowid, user_name) VALUES (1, ?)", (self.chat,))
+        conn.execute("CREATE TABLE VoiceInfo (chat_name_id INTEGER, create_time INTEGER, "
+                     "local_id INTEGER, svr_id INTEGER, voice_data BLOB, data_index TEXT)")
+        conn.execute("INSERT INTO VoiceInfo VALUES (?,?,?,?,?,?)",
+                     (1, ts, local_id, svr_id, b"\x02#!SILK_V3abc", "0"))
+        conn.commit(); conn.close()
+
+    def test_export_includes_transcoded_voice_media(self):
+        from siwx import exporter as ex
+        self._add_voice_message()
+        old = ex.voice.transcode_voice
+        try:
+            ex.voice.transcode_voice = lambda data, target="wav": (
+                b"RIFFxxxxWAVEfmt ", {"format": "wav", "mimetype": "audio/wav", "ext": "wav", "engine": "fake"})
+            res = ex.run_export(self.acc, self.account, self.chat, "联系人B",
+                                fmt="html", want_media=False, want_voice=True,
+                                want_avatars=False,
+                                export_root=self.tmp / "exports", pack="none")
+        finally:
+            ex.voice.transcode_voice = old
+        html = Path(res["file"]).read_text(encoding="utf-8")
+        self.assertEqual(res["voice_count"], 1)
+        self.assertTrue((Path(res["file"]).parent / "media" / "voice_0000_99.wav").is_file())
+        self.assertIn("voice_0000_99.wav", html)
+
+    def test_all_formats_can_reference_exported_voice(self):
+        from siwx import exporter as ex
+        self._add_voice_message(local_id=77, svr_id=777, ts=1_700_000_077)
+        old = ex.voice.transcode_voice
+        try:
+            ex.voice.transcode_voice = lambda data, target="wav": (
+                b"RIFFxxxxWAVEfmt ", {"format": "wav", "mimetype": "audio/wav", "ext": "wav", "engine": "fake"})
+            for fmt in ("json", "html", "txt", "csv", "markdown", "toml", "sqlite", "xlsx"):
+                with self.subTest(fmt=fmt):
+                    res = ex.run_export(self.acc, self.account, self.chat, "联系人B",
+                                        fmt=fmt, want_media=False, want_voice=True,
+                                        want_avatars=False, export_root=self.tmp / "voice_formats",
+                                        folder_name=f"voice_{fmt}", pack="none")
+                    out_file = Path(res["file"])
+                    voice_file = out_file.parent / "media" / "voice_0000_77.wav"
+                    self.assertTrue(voice_file.is_file())
+                    self.assertEqual(res["voice_count"], 1)
+                    if fmt == "sqlite":
+                        conn = sqlite3.connect(out_file)
+                        vals = [r[0] for r in conn.execute("SELECT mediaFile FROM messages WHERE mediaFile IS NOT NULL")]
+                        conn.close()
+                        self.assertIn("media/voice_0000_77.wav", vals)
+                    elif fmt == "xlsx":
+                        from openpyxl import load_workbook
+                        wb = load_workbook(out_file, read_only=True)
+                        vals = [row[-1] for row in wb.active.iter_rows(values_only=True)]
+                        self.assertIn("media/voice_0000_77.wav", vals)
+                    else:
+                        self.assertIn("voice_0000_77.wav", out_file.read_text(encoding="utf-8"))
+        finally:
+            ex.voice.transcode_voice = old
+
+
+# ── 7. messages 的 limit 下限 ───────────────────────────────────
+
+class TestAvatarApi(TempRootCase):
+
+    def test_owner_avatar_falls_back_to_clean_wxid(self):
+        """输出目录名可能带 _数字后缀，但头像库里本人是原始 wxid。"""
+        acc, account, _chat = make_account(self.tmp, account="wxid_owner_1234", n_texts=1)
+        (acc / "head_image").mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(acc / "head_image" / "head_image.db")
+        conn.execute("CREATE TABLE head_image (username TEXT PRIMARY KEY, md5 TEXT, image_buffer BLOB, update_time INTEGER)")
+        conn.execute("INSERT INTO head_image VALUES (?,?,?,?)",
+                     ("wxid_owner", "m", b"JPEGDATA", 1))
+        conn.commit(); conn.close()
+        from siwx.server import app
+        r = app.test_client().get("/api/chat/avatar?account=wxid_owner_1234&username=wxid_owner_1234")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.data, b"JPEGDATA")
+
+
+class TestSettingsAutoSync(TempRootCase):
+
+    def test_auto_sync_settings_roundtrip(self):
+        from siwx.server import app
+        c = app.test_client()
+        r = c.post("/api/settings/auto-sync", json={"enabled": True, "interval_minutes": 5})
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.get_json()["enabled"])
+        self.assertEqual(r.get_json()["interval_minutes"], 5)
+        r2 = c.get("/api/settings/auto-sync")
+        self.assertEqual(r2.status_code, 200)
+        self.assertEqual(r2.get_json()["interval_minutes"], 5)
+
+    def test_auto_sync_interval_is_clamped(self):
+        from siwx.server import app
+        r = app.test_client().post("/api/settings/auto-sync", json={"enabled": True, "interval_minutes": 99999})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.get_json()["interval_minutes"], 1440)
+
+
+class TestStatsApi(TempRootCase):
+    """聊天统计：跨分片聚合、类型分布、时间维度、缓存与过滤。"""
+
+    @staticmethod
+    def _make_stats_account(root: Path, account="wxid_demo_a"):
+        """构造含多分片、多类型、多发送者的统计样本。"""
+        acc = root / "output" / account
+        msg_dir = acc / "message"
+        msg_dir.mkdir(parents=True, exist_ok=True)
+        # 固定基准时间（本地时区正午）：任何时区下这 6 条消息的本地日期都是
+        # 2023-11-15。此前硬编码 epoch（=2023-11-15 06:13 +08:00），在 UTC 的
+        # CI 上跨到 11-14/11-15 两天，日期过滤用例把 6 条过滤成了 1 条。
+        from datetime import datetime
+        base = int(datetime(2023, 11, 15, 12, 0, 0).timestamp())
+
+        def shard(name, chat, rows):
+            conn = sqlite3.connect(msg_dir / name)
+            t = _msg_table(chat)
+            conn.execute(f"""CREATE TABLE [{t}] (
+                local_id INTEGER PRIMARY KEY, server_id INTEGER, local_type INTEGER,
+                create_time INTEGER, origin_source INTEGER, real_sender_id INTEGER,
+                message_content BLOB, packed_info_data BLOB)""")
+            for i, (ltype, ts, sid) in enumerate(rows):
+                conn.execute(f"INSERT INTO [{t}] VALUES (?,?,?,?,?,?,?,?)",
+                             (i + 1, 100 + i, ltype, ts, 0, sid, b"x", None))
+            conn.execute("CREATE TABLE Name2Id (user_name TEXT)")
+            conn.execute("INSERT INTO Name2Id(rowid, user_name) VALUES (1, ?)", (chat,))
+            conn.commit()
+            conn.close()
+
+        # 分片 0：文本 + 图片，发送者 1
+        shard("message_0.db", "wxid_demo_b",
+              [(1, base, 1), (1, base + 3600, 1), (3, base + 7200, 1)])
+        # 分片 1：表情 + 语音，发送者 2
+        shard("message_1.db", "wxid_demo_c",
+              [(47, base + 100, 2), (34, base + 200, 2)])
+        # 分片 2：系统消息 + 一年前的文本
+        shard("message_2.db", "wxid_demo_d",
+              [(10000, base + 300, 0), (1, base - 400 * 86400, 1)])
+
+        # 三个不同会话 → chat_count 应为 3；联系人库用于验证排行显示昵称。
+        (acc / "contact").mkdir(parents=True, exist_ok=True)
+        c = sqlite3.connect(acc / "contact" / "contact.db")
+        c.execute("CREATE TABLE contact (username TEXT, remark TEXT, nick_name TEXT, "
+                  "alias TEXT, verify_flag INTEGER)")
+        c.executemany("INSERT INTO contact VALUES (?,?,?,?,?)", [
+            ("wxid_demo_b", "联系人B", "", "", 0),
+            ("wxid_demo_c", "", "联系人C", "", 0),
+            ("wxid_demo_d", "", "联系人D", "", 0),
+            ("gh_demo01", "", "公众号A", "news_alias", 1053),
+            ("demogroup01@chatroom", "", "群聊A", "", 0),
+        ])
+        c.commit()
+        c.close()
+        return acc, account
+
+    def test_overview_totals_and_types(self):
+        self._make_stats_account(self.tmp)
+        from siwx.server import app
+        r = app.test_client().get("/api/stats/overview?account=wxid_demo_a")
+        self.assertEqual(r.status_code, 200)
+        d = r.get_json()
+        self.assertEqual(d["total"], 7)
+        self.assertEqual(d["chat_count"], 3)
+        self.assertEqual(d["shards"], 3)
+        # 类型分组：文本 3、图片 1、表情 1、语音 1、系统 1（合计 7）
+        groups = {g["label"]: g["count"] for g in d["type_groups"]}
+        self.assertEqual(groups.get("文本"), 3)
+        self.assertEqual(groups.get("图片"), 1)
+        self.assertEqual(groups.get("表情"), 1)
+        self.assertEqual(groups.get("语音"), 1)
+        self.assertEqual(groups.get("系统"), 1)
+        # 分组之和必须等于总量，否则图表会缺数据
+        self.assertEqual(sum(groups.values()), d["total"])
+
+    def test_hour_and_weekday_histograms(self):
+        self._make_stats_account(self.tmp)
+        from siwx.server import app
+        d = app.test_client().get("/api/stats/overview?account=wxid_demo_a").get_json()
+        self.assertEqual(len(d["by_hour"]), 24)
+        self.assertEqual(len(d["by_weekday"]), 7)
+        # 直方图总量应等于消息总数（每条消息恰好落进一个小格）
+        self.assertEqual(sum(d["by_hour"]), d["total"])
+        self.assertEqual(sum(d["by_weekday"]), d["total"])
+
+    def test_month_series_spans_multiple_months(self):
+        self._make_stats_account(self.tmp)
+        from siwx.server import app
+        d = app.test_client().get("/api/stats/overview?account=wxid_demo_a").get_json()
+        # 样本含一年前的消息 → 至少两个不同月份
+        self.assertGreaterEqual(len(d["by_month"]), 2)
+        self.assertEqual(sum(m["count"] for m in d["by_month"]), d["total"])
+
+    def test_top_senders_only_private_and_resolves_nickname(self):
+        acc, _account = self._make_stats_account(self.tmp)
+        # 群聊与公众号给更多消息，若未过滤会排到第一。
+        msg_dir = acc / "message"
+        def add_shard(name, chat, n):
+            conn = sqlite3.connect(msg_dir / name)
+            t = _msg_table(chat)
+            conn.execute(f"""CREATE TABLE [{t}] (
+                local_id INTEGER PRIMARY KEY, server_id INTEGER, local_type INTEGER,
+                create_time INTEGER, origin_source INTEGER, real_sender_id INTEGER,
+                message_content BLOB, packed_info_data BLOB)""")
+            for i in range(n):
+                conn.execute(f"INSERT INTO [{t}] VALUES (?,?,?,?,?,?,?,?)",
+                             (i + 1, 200 + i, 1, 1_700_000_000 + i, 0, 1, b"x", None))
+            conn.execute("CREATE TABLE Name2Id (user_name TEXT)")
+            conn.execute("INSERT INTO Name2Id(rowid, user_name) VALUES (1, ?)", (chat,))
+            conn.commit()
+            conn.close()
+        add_shard("message_3.db", "demogroup01@chatroom", 20)
+        add_shard("message_4.db", "gh_demo01", 30)
+
+        from siwx import stats
+        stats.clear_cache()
+        from siwx.server import app
+        d = app.test_client().get("/api/stats/overview?account=wxid_demo_a&refresh=1").get_json()
+        top = {s["wxid"]: s for s in d["top_senders"]}
+        self.assertNotIn("demogroup01@chatroom", top)
+        self.assertNotIn("gh_demo01", top)
+        # 排行按私聊会话聚合，且展示联系人备注/昵称。
+        self.assertEqual(top["wxid_demo_b"]["count"], 3)
+        self.assertEqual(top["wxid_demo_b"]["name"], "联系人B")
+        self.assertEqual(top["wxid_demo_c"]["name"], "联系人C")
+
+    def test_date_filter_narrows_all_statistics(self):
+        self._make_stats_account(self.tmp)
+        from siwx.server import app
+        c = app.test_client()
+        full = c.get("/api/stats/overview?account=wxid_demo_a").get_json()
+        filtered = c.get(
+            "/api/stats/overview?account=wxid_demo_a&start=2023-11-15&end=2023-11-15"
+        ).get_json()
+        # 样本里 6 条在 2023-11-15，1 条在 400 天前；过滤应影响整页指标。
+        self.assertEqual(full["total"], 7)
+        self.assertEqual(filtered["total"], 6)
+        self.assertEqual(sum(m["count"] for m in filtered["by_month"]), 6)
+        self.assertEqual(sum(filtered["by_hour"]), 6)
+        self.assertEqual(sum(filtered["by_weekday"]), 6)
+        groups = {g["label"]: g["count"] for g in filtered["type_groups"]}
+        self.assertEqual(groups.get("文本"), 2)
+        top = {s["wxid"]: s["count"] for s in filtered["top_senders"]}
+        # wxid_demo_d 在当天只有 1 条系统消息；一年前那条文本不应混进范围内。
+        self.assertEqual(top.get("wxid_demo_d"), 1)
+
+    def test_cache_hit_after_first_compute(self):
+        acc, account = self._make_stats_account(self.tmp)
+        from siwx import stats
+        stats.clear_cache()
+        stats.compute_stats(account)
+        self.assertTrue((acc / ".siwx_stats.json").is_file())
+        sig = stats.signature(account)
+        self.assertIsNotNone(sig)
+        # 磁盘缓存可被读取（内容与签名匹配）
+        cached = stats._load_disk_cache(account, sig)
+        self.assertIsNotNone(cached)
+        self.assertEqual(cached["total"], 7)
+
+    def test_cache_invalidated_when_shard_changes(self):
+        acc, account = self._make_stats_account(self.tmp)
+        from siwx import stats
+        stats.clear_cache()
+        stats.compute_stats(account)
+        old_sig = stats.signature(account)
+        # 追加一个分片 → 签名必须变化，否则统计会永久停在旧结果
+        conn = sqlite3.connect(acc / "message" / "message_9.db")
+        t = _msg_table("wxid_new")
+        conn.execute(f"""CREATE TABLE [{t}] (
+            local_id INTEGER PRIMARY KEY, server_id INTEGER, local_type INTEGER,
+            create_time INTEGER, origin_source INTEGER, real_sender_id INTEGER,
+            message_content BLOB, packed_info_data BLOB)""")
+        conn.execute(f"INSERT INTO [{t}] VALUES (1,1,1,1700000500,0,1,?,NULL)", (b"x",))
+        conn.commit()
+        conn.close()
+        new_sig = stats.signature(account)
+        self.assertNotEqual(old_sig, new_sig)
+        self.assertIsNone(stats._load_disk_cache(account, new_sig))
+        self.assertEqual(stats.compute_stats(account)["total"], 8)
+
+    def test_accounts_endpoint_lists_only_decrypted(self):
+        self._make_stats_account(self.tmp)
+        (self.tmp / "output" / "wxid_no_msg").mkdir(parents=True, exist_ok=True)
+        from siwx.server import app
+        d = app.test_client().get("/api/stats/accounts").get_json()
+        names = [a["wxid"] for a in d["accounts"]]
+        self.assertIn("wxid_demo_a", names)
+        self.assertNotIn("wxid_no_msg", names)
+
+    def test_overview_requires_account(self):
+        from siwx.server import app
+        self.assertEqual(app.test_client().get("/api/stats/overview").status_code, 400)
+
+    def test_overview_unknown_account_is_404(self):
+        from siwx.server import app
+        r = app.test_client().get("/api/stats/overview?account=wxid_missing")
+        self.assertEqual(r.status_code, 404)
+
+    def test_refresh_endpoint_recomputes(self):
+        self._make_stats_account(self.tmp)
+        from siwx.server import app
+        r = app.test_client().post("/api/stats/refresh", json={"account": "wxid_demo_a"})
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.get_json()["ok"])
+        self.assertEqual(r.get_json()["total"], 7)
+
+    def test_empty_account_returns_zeroes(self):
+        acc = self.tmp / "output" / "wxid_empty"
+        (acc / "message").mkdir(parents=True, exist_ok=True)
+        from siwx.server import app
+        d = app.test_client().get("/api/stats/overview?account=wxid_empty").get_json()
+        self.assertEqual(d["total"], 0)
+        self.assertEqual(d["chat_count"], 0)
+        self.assertEqual(d["type_groups"], [])
+
+
+class TestLimitGuard(TempRootCase):
+
+    def test_negative_limit_is_clamped(self):
+        acc, account, chat = make_account(self.tmp, n_texts=30)
+        from siwx.server import app
+        c = app.test_client()
+        r = c.get(f"/api/chat/messages?account={account}&chat={chat}&limit=-1")
+        self.assertEqual(r.status_code, 200)
+        n = len(r.get_json()["messages"])
+        self.assertLessEqual(n, 300)
+        self.assertGreater(n, 0)
+
+
+class TestChatTimelineAndStats(TempRootCase):
+
+    def test_timeline_and_conversation_stats(self):
+        _acc, account, chat = make_account(self.tmp, n_texts=6)
+        from siwx.server import app
+        c = app.test_client()
+        tl = c.get(f"/api/chat/timeline?account={account}&chat={chat}")
+        self.assertEqual(tl.status_code, 200)
+        self.assertEqual(tl.get_json()["total"], 6)
+        self.assertTrue(tl.get_json()["months"])
+        month = tl.get_json()["months"][0]["month"]
+        days = c.get(f"/api/chat/timeline?account={account}&chat={chat}&month={month}")
+        self.assertEqual(days.status_code, 200)
+        self.assertEqual(days.get_json()["total"], 6)
+        self.assertTrue(days.get_json()["days"])
+
+        st = c.get(f"/api/chat/stats?account={account}&chat={chat}")
+        self.assertEqual(st.status_code, 200)
+        d = st.get_json()
+        self.assertEqual(d["total"], 6)
+        self.assertEqual(d["types"][0]["label"], "文本消息")
+        self.assertGreaterEqual(d["active_days"], 1)
+
+
+class TestManualWechatPaths(TempRootCase):
+
+    def test_validate_endpoint_persists_manual_path(self):
+        db_dir = self.tmp / "custom" / "wxid_manual" / "db_storage"
+        db_dir.mkdir(parents=True)
+        from siwx.server import app
+        from siwx.discover import load_manual_data_dirs, manual_paths_file
+        r = app.test_client().post("/api/discover/validate", json={"path": str(db_dir)})
+        self.assertEqual(r.status_code, 200)
+        d = r.get_json()
+        self.assertTrue(d["ok"])
+        self.assertTrue(d["saved"])
+        self.assertTrue(manual_paths_file().is_file())
+        self.assertIn(("wxid_manual", str(db_dir.resolve())), load_manual_data_dirs())
+
+    def test_resolves_account_subdir_and_database_file(self):
+        from siwx.discover import resolve_db_paths
+        db_dir = self.tmp / "xwechat_files" / "wxid_one" / "db_storage"
+        message = db_dir / "message"
+        message.mkdir(parents=True)
+        db_file = message / "message_0.db"
+        db_file.write_bytes(b"")
+        expected = [{"wxid": "wxid_one", "db_dir": str(db_dir.resolve())}]
+        self.assertEqual(resolve_db_paths(str(db_dir.parent)), expected)
+        self.assertEqual(resolve_db_paths(str(message)), expected)
+        self.assertEqual(resolve_db_paths(str(db_file)), expected)
+
+    def test_xwechat_root_finds_multiple_accounts(self):
+        from siwx.discover import validate_db_path
+        root = self.tmp / "xwechat_files"
+        for wxid in ("wxid_a", "wxid_b"):
+            (root / wxid / "db_storage").mkdir(parents=True)
+        d = validate_db_path(str(root))
+        self.assertTrue(d["ok"])
+        self.assertEqual(d["account_count"], 2)
+        self.assertEqual({a["wxid"] for a in d["accounts"]}, {"wxid_a", "wxid_b"})
+
+
+# ── 8. 解密原子写 ───────────────────────────────────────────────
+
+class TestDecryptAtomic(unittest.TestCase):
+    """构造一个合法的 SQLCipher 4 单页库，验证解密与失败时的原子性。"""
+
+    @staticmethod
+    def _encrypt_page(plain_body: bytes, pageno: int, enc_key: bytes,
+                      salt: bytes, is_first: bool):
+        from Crypto.Cipher import AES
+        mac_salt = bytes(b ^ 0x3A for b in salt)
+        mac_key = hashlib.pbkdf2_hmac("sha512", enc_key, mac_salt, 2, dklen=32)
+        iv = bytes((pageno * 7 + i) & 0xFF for i in range(16))
+        ct = AES.new(enc_key, AES.MODE_CBC, iv).encrypt(plain_body)
+        if is_first:
+            page = salt + ct + iv
+        else:
+            page = ct + iv
+        # 与 verify_enc_key 对齐：HMAC 覆盖 page1[16:]（页 1 跳过 salt）
+        mac_input = page[len(salt):] if is_first else page
+        mac = hmac_mod.new(mac_key, mac_input, hashlib.sha512)
+        mac.update(struct.pack("<I", pageno))
+        return page + mac.digest()
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="siwx_db_"))
+        from Crypto.Cipher import AES
+        from siwx.sqlcipher import PAGE_SZ, RESERVE_SZ, SALT_SZ
+        self.enc_key = bytes(range(32))
+        salt = bytes(range(16, 32))
+        body_len = PAGE_SZ - RESERVE_SZ          # 4016
+        # 页 1：正文 4000 字节（salt 占掉 16）
+        page1 = self._encrypt_page(bytes((i * 3) & 0xFF for i in range(body_len - SALT_SZ)),
+                                   1, self.enc_key, salt, True)
+        # 页 2
+        page2 = self._encrypt_page(bytes((i * 5) & 0xFF for i in range(body_len)),
+                                   2, self.enc_key, salt, False)
+        self.src = self.tmp / "src.db"
+        self.src.write_bytes(page1 + page2)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_verify_enc_key_accepts_and_rejects(self):
+        """verify_enc_key 的真实调用路径（此前全仓只有 mock，零真实覆盖）。
+
+        它是密钥校验的第一道闸：合法 page1 必须放行、错误密钥与截断页必须拒绝。
+        页构造复用本类的 _encrypt_page（HMAC 布局与实现严格对齐）；
+        原 test_verify_enc_key_byte_layout 的字节布局常量断言并入此处作前置。
+        """
+        from siwx import sqlcipher as sc
+        # 页 1 布局：salt(16) + 密文(4000) + iv(16) + hmac(64) == 4096
+        self.assertEqual(sc.PAGE_SZ - sc.RESERVE_SZ + sc.IV_SZ - sc.SALT_SZ, 4016)
+        salt = bytes(range(16, 32))
+        plain = bytes((i * 3) & 0xFF for i in range(sc.PAGE_SZ - sc.RESERVE_SZ - sc.SALT_SZ))
+        page1 = self._encrypt_page(plain, 1, self.enc_key, salt, True)
+        self.assertTrue(sc.verify_enc_key(self.enc_key, page1))
+        self.assertFalse(sc.verify_enc_key(bytes(32), page1), "错误密钥必须拒绝")
+        self.assertFalse(sc.verify_enc_key(self.enc_key, page1[:100]),
+                         "长度不足一页必须拒绝而非异常")
+
+    def test_decrypts_and_leaves_no_residue(self):
+        from siwx.sqlcipher import decrypt_database
+        dst = self.tmp / "out" / "dst.db"
+        pages = decrypt_database(self.src, dst, self.enc_key)
+        self.assertEqual(pages, 2)
+        self.assertTrue(dst.is_file())
+        self.assertEqual(dst.stat().st_size, 2 * 4096)
+        with dst.open("rb") as f:
+            self.assertEqual(f.read(16), b"SQLite format 3\x00")
+        residue = list(dst.parent.glob("*.part")) + list(dst.parent.glob("*.tmp"))
+        self.assertEqual(residue, [], f"残留临时文件: {residue}")
+
+    def test_decrypted_body_equals_plaintext(self):
+        """整库解密的正文必须与原始明文**逐字节一致**（CBC 链式 XOR 回归）。
+
+        覆盖 page1（salt 特例，4000 字节密文）与后续页（4016 字节密文）两种长度。
+        现有用例只断言了大小与头部，此处补齐内容校验 —— 这是 strxor 改写
+        （由大整数 XOR 换成 C 实现）最直接的回归防线。
+        """
+        from siwx.sqlcipher import decrypt_database, PAGE_SZ, RESERVE_SZ, SALT_SZ
+        dst = self.tmp / "out" / "body.db"
+        decrypt_database(self.src, dst, self.enc_key)
+        body_len = PAGE_SZ - RESERVE_SZ
+        plain1 = bytes((i * 3) & 0xFF for i in range(body_len - SALT_SZ))
+        plain2 = bytes((i * 5) & 0xFF for i in range(body_len))
+        zeros = b"\x00" * RESERVE_SZ
+        expect = b"SQLite format 3\x00" + plain1 + zeros + plain2 + zeros
+        self.assertEqual(dst.read_bytes(), expect)
+
+    def test_failure_does_not_clobber_existing_file(self):
+        """源库密钥错误时，已存在的明文库必须保持原样。"""
+        from siwx.sqlcipher import decrypt_database
+        dst = self.tmp / "out" / "dst.db"
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(b"ORIGINAL-GOOD-CONTENT")
+        with self.assertRaises(ValueError):
+            decrypt_database(self.src, dst, bytes(32))   # 错误密钥
+        self.assertEqual(dst.read_bytes(), b"ORIGINAL-GOOD-CONTENT")
+        residue = list(dst.parent.glob("*.part"))
+        self.assertEqual(residue, [], f"残留临时文件: {residue}")
+
+
+# ── 9. CLI --json ───────────────────────────────────────────────
+
+class _TempAppDirsCase(TempRootCase):
+    """P3-25：SIWX_ROOT 之外，把 siwx.log 的文件 handler 也临时指向 tmp/logs。
+
+    logging_setup 在 server 首次导入时就把 app_root()/logs/siwx.log 固化进
+    RotatingFileHandler（全量套件里早于本用例），只切 SIWX_ROOT 不够——日志
+    仍会写进真实安装目录。这里就地改路径、用例结束还原，不重建 server 单例。
+    """
+
+    def setUp(self):
+        super().setUp()
+        from siwx import server
+        self._log_handlers = []
+        log_dir = self.tmp / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        for h in server._siwx_logger.handlers:
+            base = getattr(h, "baseFilename", None)
+            if not base:
+                continue
+            self._log_handlers.append((h, base))
+            self._retarget(h, str(log_dir / Path(base).name))
+
+    @staticmethod
+    def _retarget(handler, path: str) -> None:
+        """就地换文件：关旧流 → 改 baseFilename → 重开（handler 不摘除）。"""
+        handler.acquire()
+        try:
+            if getattr(handler, "stream", None) is not None:
+                handler.stream.close()
+                handler.stream = None
+            handler.baseFilename = path
+            handler.stream = handler._open()
+        finally:
+            handler.release()
+
+    def tearDown(self):
+        for handler, original in getattr(self, "_log_handlers", []):
+            try:
+                self._retarget(handler, original)
+            except OSError:
+                pass
+        super().tearDown()
+
+
+class TestLogsApi(_TempAppDirsCase):
+    """/api/logs 条目是**混合形状**的：
+
+    旧/文件日志 → [ts_ms, text]；结构化日志（siwx.logger）→ [ts_ms, level, module, text]。
+    因此断言必须走统一的取文本逻辑，不能假定固定长度（插件加载等会在启动期
+    就写入结构化日志，使结构化条目非空）。
+    """
+
+    @staticmethod
+    def _texts(data):
+        items = data.get("logs", []) if isinstance(data, dict) else (data or [])
+        return [str(it[3] if len(it) >= 4 else it[1]) for it in items]
+
+    def test_api_logs_includes_file_logger_messages(self):
+        """日志页不能只看内存 ring；普通 logger 写入的文件日志也要显示。"""
+        from siwx import server
+        marker = f"unit-log-marker-{int(time.time() * 1000)}"
+        server._siwx_logger.info(marker)
+        for h in server._siwx_logger.handlers:
+            try:
+                h.flush()
+            except Exception:
+                pass
+        data = server.app.test_client().get("/api/logs").get_json()
+        self.assertTrue(any(marker in m for m in self._texts(data)),
+                        "文件日志没有出现在 /api/logs")
+
+    def test_404_is_not_logged_as_uncaught_error(self):
+        from siwx import server
+        before = len(server.app.test_client().get("/api/logs").get_json().get("logs", []))
+        r = server.app.test_client().get("/__definitely_missing__")
+        self.assertEqual(r.status_code, 404)
+        data = server.app.test_client().get("/api/logs").get_json()
+        lines = self._texts(data)
+        self.assertFalse(any("__definitely_missing__" in m or "404 Not Found" in m
+                             for m in lines[-20:]))
+        self.assertGreaterEqual(len(lines), before)
+
+    def test_task_exception_is_persisted_to_file_logs(self):
+        from siwx import server
+        marker = "unit-task-failure-marker"
+        try:
+            raise RuntimeError(marker)
+        except Exception as e:
+            server._siwx_logger.exception("任务执行失败: %s", e)
+            server._flush_logs()
+        data = server.app.test_client().get("/api/logs").get_json()
+        self.assertTrue(any(marker in m for m in self._texts(data)),
+                        "任务异常没有落盘到 /api/logs")
+
+    def test_all_log_items_are_renderable(self):
+        """混合形状下的健壮性：每条日志都能取出文本，且前端可安全渲染。"""
+        from siwx import server, logger as _log
+        _log.info("plugin", "unit-mixed-shape-marker")
+        items = server.app.test_client().get("/api/logs").get_json()["logs"]
+        self.assertTrue(items, "日志不应为空")
+        texts = self._texts(items)
+        self.assertTrue(all(isinstance(t, str) and t for t in texts),
+                        "存在无法取文本的日志条目")
+        self.assertTrue(any("unit-mixed-shape-marker" in t for t in texts))
+
+
+class TestCliJson(unittest.TestCase):
+
+    def test_json_flag_emits_parseable_json(self):
+        import argparse
+        from siwx import cli, extract
+        old = extract.extract_all
+        extract.extract_all = lambda **kw: [
+            {"wxid": "wxid_x", "db_count": 1, "total_salts": 2, "verified": 2,
+             "cached": 0, "duration_ms": 1, "salts": []}]
+        try:
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                code = cli.cmd_keys_extract(
+                    argparse.Namespace(json=True, no_cache=False))
+            self.assertEqual(code, 0)
+            self.assertEqual(json.loads(buf.getvalue())[0]["wxid"], "wxid_x")
+        finally:
+            extract.extract_all = old
+
+    def test_json_flag_returns_1_when_no_accounts(self):
+        import argparse
+        from siwx import cli, extract
+        old = extract.extract_all
+        extract.extract_all = lambda **kw: []
+        try:
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                code = cli.cmd_keys_extract(
+                    argparse.Namespace(json=True, no_cache=False))
+            self.assertEqual(code, 1)
+        finally:
+            extract.extract_all = old
+
+    def test_db_dir_is_forwarded_not_ignored(self):
+        """--db-dir 必须透传给 extract_all（PR #27：此前被静默忽略，
+        多账号机器无法把 LLDB 断点捕获窗口留给目标账号）。"""
+        import argparse
+        from siwx import cli, extract
+        captured = {}
+        old = extract.extract_all
+        extract.extract_all = lambda **kw: captured.update(kw) or [
+            {"wxid": "wxid_x", "db_count": 1, "total_salts": 1, "verified": 1,
+             "cached": 0, "duration_ms": 1, "salts": []}]
+        tmp = Path(tempfile.mkdtemp(prefix="siwx_dbdir_"))
+        try:
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                code = cli.cmd_keys_extract(
+                    argparse.Namespace(json=True, no_cache=False,
+                                       db_dir=str(tmp)))
+            self.assertEqual(code, 0)
+            self.assertEqual(captured.get("dirs"),
+                             [(extract.wxid_of(str(tmp)), str(tmp))])
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            extract.extract_all = old
+
+    def test_db_dir_missing_returns_1(self):
+        import argparse
+        from siwx import cli, extract
+        old = extract.extract_all
+        calls = []
+        extract.extract_all = lambda **kw: calls.append(kw) or []
+        try:
+            code = cli.cmd_keys_extract(
+                argparse.Namespace(json=True, no_cache=False,
+                                   db_dir="Z:/definitely/not/here"))
+            self.assertEqual(code, 1)
+            self.assertEqual(calls, [], "无效目录不应进入提取流程")
+        finally:
+            extract.extract_all = old
+
+
+# ── 10. 密码学原语未被破坏 ──────────────────────────────────────
+
+class TestVersionSource(unittest.TestCase):
+
+    def test_current_version_comes_from_package_init(self):
+        from siwx import __version__
+        from siwx.auto_update import current_version
+        self.assertEqual(current_version(), __version__)
+        self.assertEqual(__version__, "5.3.0")
+
+    def test_release_metadata_matches_package_version(self):
+        """version.json 与 README 徽章的版本号必须跟 __version__ 一致。
+
+        发版清单只钉了 `siwx/__init__.py` 与测试里的字面量，version.json
+        （对外公布的更新清单）与 README 徽章不在其中——曾出现 __version__
+        已升到 5.0.7、README 徽章也写 5.0.7，而 version.json 仍停在 5.0.6
+        的三处不一致（以 version.json 为准的更新链会读到旧版本）。
+        """
+        from siwx import __version__
+        import re as _re
+        meta = json.loads((ROOT / "version.json").read_text(encoding="utf-8"))
+        self.assertEqual(meta["version"], __version__,
+                         "version.json 的 version 与 siwx.__version__ 不一致")
+        badge = _re.search(r"badge/version-([0-9]+\.[0-9]+\.[0-9]+)-",
+                           (ROOT / "README.md").read_text(encoding="utf-8"))
+        self.assertIsNotNone(badge, "README 未找到版本徽章")
+        self.assertEqual(badge.group(1), __version__,
+                         "README 徽章版本与 siwx.__version__ 不一致")
+
+    def test_remote_version_uses_newest_source_and_bypasses_cache(self):
+        from siwx import auto_update
+
+        seen = []
+
+        def fake_urlopen(req, timeout):
+            seen.append(req)
+            version = "5.0.0" if "gh.1s.fan" in req.full_url else "5.0.1"
+            return io.BytesIO(json.dumps({"version": version}).encode("utf-8"))
+
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            remote = auto_update.fetch_remote_version()
+
+        self.assertEqual(remote["version"], "5.0.1")
+        self.assertEqual(len(seen), len(auto_update.VERSION_URLS))
+        for req in seen:
+            self.assertIn("_siwx_update=", req.full_url)
+            self.assertEqual(req.get_header("Cache-control"), "no-cache")
+            self.assertEqual(req.get_header("Pragma"), "no-cache")
+
+    def test_update_check_response_is_not_cached(self):
+        from flask import Flask
+        from siwx import api_update
+
+        app = Flask(__name__)
+        app.register_blueprint(api_update.bp)
+        remote = {"version": "5.0.1", "notes": "update"}
+        with mock.patch.object(api_update, "has_update",
+                               return_value=(True, remote, "5.0.0")):
+            response = app.test_client().get("/api/update/check")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()["has_update"])
+        self.assertIn("no-store", response.headers["Cache-Control"])
+        self.assertEqual(response.headers["Pragma"], "no-cache")
+
+
+class TestAutoUpdateInstall(unittest.TestCase):
+    """自动更新安装环节：跨盘安全、带版本号文件名、失败可回滚。
+
+    背景：os.replace 不能跨盘（WinError 17），且旧逻辑硬编码替换
+    stories-in-wx.exe——用户目录里往往是按版本号命名的多个 exe，
+    根本没有这个名字的文件。
+    """
+
+    @staticmethod
+    def _write(dir_path: Path, name: str, content: bytes) -> Path:
+        p = dir_path / name
+        p.write_bytes(content)
+        return p
+
+    def _patch_common(self, auto_update, paths, app_dir, running):
+        return [
+            mock.patch.object(paths, "app_root", return_value=app_dir),
+            mock.patch.object(auto_update.sys, "executable", str(running)),
+            mock.patch.object(auto_update, "_schedule_exit"),
+        ]
+
+    def test_target_exe_name_versioned_bumps_version(self):
+        from siwx.auto_update import _target_exe_name
+        self.assertEqual(
+            _target_exe_name("stories-in-wx-v5.0.4-windows-x64.exe",
+                             "5.0.4", "5.0.5"),
+            "stories-in-wx-v5.0.5-windows-x64.exe")
+
+    def test_target_exe_name_plain_name_kept_inplace(self):
+        from siwx.auto_update import _target_exe_name
+        self.assertEqual(
+            _target_exe_name("stories-in-wx.exe", "5.0.4", "5.0.5"),
+            "stories-in-wx.exe")
+
+    def test_target_exe_name_ignores_unrelated_versions(self):
+        from siwx.auto_update import _target_exe_name
+        # 文件名里的版本号与当前版本不符（用户改过名）→ 就地替换
+        self.assertEqual(
+            _target_exe_name("stories-in-wx-v0.4.0-windows-x64.exe",
+                             "5.0.4", "5.0.5"),
+            "stories-in-wx-v0.4.0-windows-x64.exe")
+        # 版本号子串不能误伤（v5.0.4 ≠ v5.0.45）
+        self.assertEqual(
+            _target_exe_name("stories-in-wx-v5.0.45.exe", "5.0.4", "5.0.5"),
+            "stories-in-wx-v5.0.45.exe")
+
+    def test_install_copy_verifies_content(self):
+        from siwx import auto_update
+        with tempfile.TemporaryDirectory() as td:
+            src = self._write(Path(td), "src.exe", b"A" * 4096)
+            dst = Path(td) / "sub" / "dst.exe"
+            dst.parent.mkdir()
+            # 临时目录模拟不了真跨盘，但 copyfile 路径与盘符布局无关
+            auto_update._install_copy(src, dst)
+            self.assertEqual(dst.read_bytes(), b"A" * 4096)
+
+    def test_install_copy_bad_sha_leaves_no_residue(self):
+        from siwx import auto_update
+        with tempfile.TemporaryDirectory() as td:
+            src = self._write(Path(td), "src.exe", b"DATA")
+            dst = Path(td) / "dst.exe"
+            with self.assertRaises(RuntimeError):
+                auto_update._install_copy(src, dst, expected_sha="0" * 64)
+            self.assertFalse(dst.exists())
+
+    def test_replace_windows_exe_writes_versioned_target(self):
+        """用户实际场景：目录里全是带版本号的 exe，正在运行 v5.0.4。"""
+        from siwx import auto_update, paths
+        with tempfile.TemporaryDirectory() as td:
+            app_dir = Path(td)
+            running = self._write(app_dir, "stories-in-wx-v5.0.4-windows-x64.exe", b"OLD")
+            new_exe = self._write(app_dir, "downloaded.exe", b"NEW")
+            launched = []
+            patches = self._patch_common(auto_update, paths, app_dir, running)
+            patches += [
+                mock.patch.object(auto_update, "current_version",
+                                  return_value="5.0.4"),
+                mock.patch.object(auto_update.subprocess, "Popen",
+                                  side_effect=lambda cmd, **kw: launched.append(cmd)),
+            ]
+            with contextlib.ExitStack() as stack:
+                for p in patches:
+                    stack.enter_context(p)
+                result = auto_update._replace_windows_exe(new_exe, "5.0.5")
+
+            self.assertTrue(result["ok"], result)
+            target = app_dir / "stories-in-wx-v5.0.5-windows-x64.exe"
+            self.assertEqual(target.read_bytes(), b"NEW")
+            # 正在运行的旧 exe 不被触碰
+            self.assertEqual(running.read_bytes(), b"OLD")
+            self.assertEqual(launched[0][0], str(target))
+
+    def test_replace_windows_exe_inplace_success_keeps_backup(self):
+        from siwx import auto_update, paths
+        with tempfile.TemporaryDirectory() as td:
+            app_dir = Path(td)
+            running = self._write(app_dir, "stories-in-wx.exe", b"OLD")
+            new_exe = self._write(app_dir, "downloaded.exe", b"NEW")
+            good_sha = hashlib.sha256(b"NEW").hexdigest()
+            launched = []
+            patches = self._patch_common(auto_update, paths, app_dir, running)
+            patches += [
+                mock.patch.object(auto_update, "current_version",
+                                  return_value="5.0.5"),
+                mock.patch.object(auto_update.subprocess, "Popen",
+                                  side_effect=lambda cmd, **kw: launched.append(cmd)),
+            ]
+            with contextlib.ExitStack() as stack:
+                for p in patches:
+                    stack.enter_context(p)
+                result = auto_update._replace_windows_exe(new_exe, "5.0.6", good_sha)
+
+            self.assertTrue(result["ok"], result)
+            self.assertEqual((app_dir / "stories-in-wx.exe").read_bytes(), b"NEW")
+            self.assertTrue((app_dir / "stories-in-wx.backup.exe").exists())
+            self.assertEqual(launched[0][0], str(app_dir / "stories-in-wx.exe"))
+
+    def test_replace_windows_exe_inplace_rollback_on_failure(self):
+        """复制失败必须把改名出去的旧 exe 改回来，不能把程序变砖。"""
+        from siwx import auto_update, paths
+        with tempfile.TemporaryDirectory() as td:
+            app_dir = Path(td)
+            running = self._write(app_dir, "stories-in-wx.exe", b"OLD")
+            new_exe = self._write(app_dir, "downloaded.exe", b"NEW")
+            bad_sha = hashlib.sha256(b"NOT-THIS").hexdigest()
+            patches = self._patch_common(auto_update, paths, app_dir, running)
+            patches += [
+                mock.patch.object(auto_update, "current_version",
+                                  return_value="5.0.5"),
+            ]
+            with contextlib.ExitStack() as stack:
+                for p in patches:
+                    stack.enter_context(p)
+                result = auto_update._replace_windows_exe(new_exe, "5.0.6", bad_sha)
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(running.read_bytes(), b"OLD")
+            self.assertFalse((app_dir / "stories-in-wx.backup.exe").exists())
+            self.assertFalse((app_dir / "stories-in-wx.exe.new").exists())
+
+
+class TestEnvInfo(unittest.TestCase):
+    """环境信息采集（供 bug 报告粘贴）：字段齐全、用户名打码、不污染 stdout。"""
+
+    def test_collect_has_fields_required_by_issue_template(self):
+        from siwx import __version__
+        from siwx import env_info
+
+        info = env_info.collect(quiet=True)
+        # 这几个字段对应 issue 模板里要求用户填写的内容
+        for key in ("siwx 版本", "运行模式", "操作系统", "系统版本",
+                    "系统架构", "Python", "数据目录", "密钥库"):
+            self.assertIn(key, info, f"缺少字段: {key}")
+        self.assertEqual(info["siwx 版本"], __version__)
+        self.assertIn(info["运行模式"], ("打包产物", "源码运行"))
+        # 所有值都必须是可直接粘贴的字符串
+        for key, value in info.items():
+            self.assertIsInstance(value, str, f"{key} 不是字符串")
+
+    def test_mask_path_hides_username_on_all_platforms(self):
+        from siwx.env_info import mask_path
+
+        cases = [
+            (r"C:\Users\alice\AppData\Local\stories-in-wx", "alice"),
+            ("/Users/bob/Library/Application Support/stories-in-wx", "bob"),
+            ("/home/carol/.local/share/stories-in-wx", "carol"),
+        ]
+        for raw, user in cases:
+            masked = mask_path(raw)
+            self.assertNotIn(user, masked, f"用户名未打码: {masked}")
+            self.assertIn("<user>", masked)
+
+    def test_format_text_masks_current_user(self):
+        from siwx import env_info
+
+        text = env_info.format_text(quiet=True)
+        self.assertIn("### 环境信息", text)
+        self.assertIn(f"- siwx 版本: {env_info.__version__}", text)
+        user = Path.home().name
+        if user and user not in ("root",):
+            self.assertNotIn(f"\\Users\\{user}", text, "Windows 用户名未打码")
+            self.assertNotIn(f"/Users/{user}", text, "macOS 用户名未打码")
+            self.assertNotIn(f"/home/{user}", text, "Linux 用户名未打码")
+
+    def test_collect_quiet_writes_nothing_to_stdout(self):
+        from siwx import env_info
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            info = env_info.collect(quiet=True)
+        self.assertEqual(buf.getvalue(), "", "quiet=True 仍向 stdout 输出了内容")
+        self.assertTrue(info)
+
+    def test_settings_env_api(self):
+        from flask import Flask
+        from siwx import __version__
+        from siwx import api_settings
+
+        app = Flask(__name__)
+        app.register_blueprint(api_settings.bp)
+        response = app.test_client().get("/api/settings/env")
+
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertIn("info", data)
+        self.assertIn("text", data)
+        self.assertEqual(data["info"]["siwx 版本"], __version__)
+        self.assertIn("### 环境信息", data["text"])
+        # 接口返回的文本同样必须打码
+        user = Path.home().name
+        if user and user not in ("root",):
+            self.assertNotIn(f"\\Users\\{user}", data["text"])
+            self.assertNotIn(f"/Users/{user}", data["text"])
+
+    def test_cli_doctor_prints_paste_block(self):
+        import argparse
+        from siwx import cli
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = cli.cmd_doctor(argparse.Namespace())
+
+        self.assertEqual(code, 0)
+        out = buf.getvalue()
+        self.assertIn("### 环境信息", out)
+        self.assertIn("- siwx 版本:", out)
+        self.assertIn("可直接粘贴到 GitHub issue", out)
+
+
+class TestContributionTemplates(unittest.TestCase):
+    """贡献规范化文件存在且 YAML 合法（GitHub 表单格式错误会直接不显示）。"""
+
+    def _parse(self, path: Path):
+        try:
+            import yaml
+        except ImportError:
+            self.skipTest("未安装 pyyaml，跳过表单格式校验")
+        return yaml.safe_load(path.read_text(encoding="utf-8"))
+
+    def test_issue_templates_present_and_valid(self):
+        tpl_dir = ROOT / ".github" / "ISSUE_TEMPLATE"
+        self.assertTrue(tpl_dir.is_dir(), "缺少 .github/ISSUE_TEMPLATE 目录")
+
+        expected = {"bug_report.yml", "feature_request.yml", "question.yml"}
+        found = {p.name for p in tpl_dir.glob("*.yml")}
+        self.assertTrue(expected.issubset(found), f"缺少模板: {expected - found}")
+
+        for name in sorted(expected):
+            data = self._parse(tpl_dir / name)
+            for key in ("name", "description", "body"):
+                self.assertIn(key, data, f"{name} 缺少 {key}")
+            ids = [b.get("id") for b in data["body"] if b.get("id")]
+            self.assertEqual(len(ids), len(set(ids)), f"{name} 存在重复 id")
+            for block in data["body"]:
+                self.assertIn(block.get("type"),
+                              ("markdown", "input", "textarea", "dropdown",
+                               "checkboxes"),
+                              f"{name} 含不支持的字段类型")
+
+    def test_bug_report_requires_version_os_arch(self):
+        """用户明确要求：bug 反馈必须填 siwx 版本、系统版本、架构。"""
+        data = self._parse(ROOT / ".github" / "ISSUE_TEMPLATE" / "bug_report.yml")
+        required = {b["id"] for b in data["body"]
+                    if (b.get("validations") or {}).get("required")}
+        for field in ("siwx_version", "os_version", "arch", "os",
+                      "wechat_version", "run_mode", "env_info"):
+            self.assertIn(field, required, f"bug 模板未强制要求 {field}")
+
+    def test_bug_report_arch_is_dropdown(self):
+        data = self._parse(ROOT / ".github" / "ISSUE_TEMPLATE" / "bug_report.yml")
+        arch = next(b for b in data["body"] if b.get("id") == "arch")
+        self.assertEqual(arch["type"], "dropdown")
+        options = " ".join(arch["attributes"]["options"]).lower()
+        self.assertIn("x64", options)
+        self.assertIn("arm64", options)
+
+    def test_blank_issues_disabled(self):
+        data = self._parse(ROOT / ".github" / "ISSUE_TEMPLATE" / "config.yml")
+        self.assertTrue(data.get("blank_issues_enabled") is False,
+                        "空白 issue 应被禁用，强制走模板")
+
+    def test_pr_template_and_contributing_present(self):
+        self.assertTrue((ROOT / ".github" / "PULL_REQUEST_TEMPLATE.md").is_file())
+        self.assertTrue((ROOT / "CONTRIBUTING.md").is_file())
+
+
+class TestCryptoIntact(unittest.TestCase):
+
+    def test_handwritten_cbc_matches_stdlib(self):
+        """手写 CBC 链式 XOR（现用 pycryptodome 的 C 实现 strxor）对齐标准库。"""
+        from Crypto.Cipher import AES
+        from Crypto.Util import strxor
+        from siwx.sqlcipher import PAGE_SZ, RESERVE_SZ, IV_SZ
+        key, iv = bytes(range(32)), bytes(range(16, 32))
+        for ct_len in (PAGE_SZ - RESERVE_SZ - IV_SZ, PAGE_SZ - RESERVE_SZ):
+            pt = bytes((i * 7 + 3) & 0xFF for i in range(ct_len))
+            ct = AES.new(key, AES.MODE_CBC, iv).encrypt(pt)
+            std = AES.new(key, AES.MODE_CBC, iv).decrypt(ct)
+            raw = AES.new(key, AES.MODE_ECB).decrypt(ct)
+            mine = strxor.strxor(iv + ct[:len(ct) - 16], raw)
+            self.assertEqual(mine, std, f"ct_len={ct_len}")
+
+    def test_decrypt_database_uses_c_strxor_not_bigint(self):
+        """源码层面确认页 CBC 的链式 XOR 走 C 实现 ``strxor``，而非大整数转换。
+
+        大整数 ``from_bytes``/``to_bytes`` 曾占单库解密耗时约 39%。正确性由
+        test_decrypted_body_equals_plaintext 逐字节把守——但大整数 XOR 同样
+        能通过全绿，本条是**唯一的性能防线**。只检查 ``decrypt_database``
+        函数体（其 docstring 会引用旧写法做说明，先用 ast 剥掉），不做全文件
+        禁词，避免误伤其他场景对这两个内建名的合法使用。
+        """
+        import ast
+        src = Path(__file__).resolve().parent.parent / "siwx" / "sqlcipher.py"
+        tree = ast.parse(src.read_text(encoding="utf-8"))
+        fn = next(n for n in ast.walk(tree)
+                  if isinstance(n, ast.FunctionDef) and n.name == "decrypt_database")
+        body = fn.body
+        if (isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)):
+            body.pop(0)          # 剥掉函数 docstring
+        code = ast.unparse(fn)
+        self.assertIn("strxor", code, "页 CBC 未使用 strxor")
+        self.assertNotIn("from_bytes", code, "仍在用大整数 from_bytes")
+        self.assertNotIn("to_bytes", code, "仍在用大整数 to_bytes")
+
+
+# ── 数据安全修复：临时文件唯一性（D-2）─────────────────────────
+
+class TestTempFileUniqueness(unittest.TestCase):
+    """`_read_page1` / `decrypt_database` 的临时文件必须并发唯一。
+
+    修复前用 f"siwx_p1_{os.getpid()}.tmp"：Flask 以 threaded=True 运行，
+    `/api/status` 每次请求都会走 `collect_db_files` -> `_read_page1`，
+    「微信占用中」时同进程多线程会撞名互相覆盖，读到对方的 page1，
+    进而把 salt 张冠李戴写进密钥库。
+    """
+
+    def test_read_page1_concurrent_no_crosstalk(self):
+        """并发读取多个文件，每个都必须拿到自己的 page1。"""
+        import threading
+        import builtins
+        from siwx.sqlcipher import PAGE_SZ, _read_page1
+
+        tmp = Path(tempfile.mkdtemp(prefix="siwx_p1_"))
+        # P3-25：把 mkstemp 的落点也限定到本测试目录——否则残留断言是在扫
+        # 全局 TEMP，既可能是别的进程/别的用例留下的，也可能被瞬时占用误判。
+        old_tempdir = tempfile.tempdir
+        tempfile.tempdir = str(tmp)
+        try:
+            n = 8
+            targets = []
+            for i in range(n):
+                p = tmp / f"db_{i}" / "message.db"
+                p.parent.mkdir(parents=True, exist_ok=True)
+                marker = 0x10 + i
+                p.write_bytes(bytes([marker]) * 16
+                              + bytes((j + marker) % 256 for j in range(PAGE_SZ - 16)))
+                targets.append((p, marker))
+
+            # 强制走「复制到临时文件」的回退分支。只让每个目标**首次** open
+            # 失败（模拟瞬时占用）：回退里的 shutil.copy2 还要再 open 一次源
+            # 文件——若每次都失败，只有 3.12+/Windows（copyfile 的 CopyFile2
+            # 快路径不经过 builtins.open）能通过，3.10/3.11/macOS 必然返回
+            # None，测试就变成了钉 CPython copyfile 的实现细节。改为首次失败
+            # 后放行，所有平台都稳定走到 mkstemp 唯一临时名的并发复制路径，
+            # 这才是本用例要验证的机制。
+            real_open = builtins.open
+            locked = {str(p) for p, _ in targets}
+            failed_once = set()
+
+            def flaky_open(file, *a, **kw):
+                key = str(file)
+                if key in locked and key not in failed_once:
+                    failed_once.add(key)
+                    raise OSError(13, "simulated lock")
+                return real_open(file, *a, **kw)
+
+            results, errors = {}, []
+            lock = threading.Lock()
+            barrier = threading.Barrier(n)
+
+            def worker(path, marker):
+                barrier.wait()
+                try:
+                    pg = _read_page1(path)
+                    with lock:
+                        results[str(path)] = pg[:16] if pg else None
+                except Exception as e:      # noqa: BLE001
+                    with lock:
+                        errors.append(repr(e))
+
+            builtins.open = flaky_open
+            try:
+                ts = [threading.Thread(target=worker, args=t) for t in targets]
+                for t in ts:
+                    t.start()
+                for t in ts:
+                    t.join()
+            finally:
+                builtins.open = real_open
+
+            self.assertEqual(errors, [], f"并发异常: {errors}")
+            for path, marker in targets:
+                self.assertEqual(
+                    results.get(str(path)), bytes([marker]) * 16,
+                    f"{path.parent.name} 读到的 page1 不匹配（并发串扰）")
+
+            residue = list(tmp.glob("siwx_p1_*.tmp"))
+            self.assertEqual(residue, [], f"临时文件残留: {residue}")
+        finally:
+            tempfile.tempdir = old_tempdir
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_source_uses_mkstemp(self):
+        """源码层面确认临时文件名不再是「固定前缀 + PID」的拼接。
+
+        注意：注释里会引用旧实现的名字做说明，因此只看**代码行**
+        （去掉注释与空行）是否还存在 `gettempdir() / f"siwx_..._{os.getpid()}"`。
+        """
+        src = Path(__file__).resolve().parent.parent / "siwx" / "sqlcipher.py"
+        code_lines = []
+        for line in src.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if stripped.startswith("#") or not stripped:
+                continue
+            code_lines.append(stripped)
+        code = "\n".join(code_lines)
+        self.assertNotIn("siwx_p1_{os.getpid()}", code,
+                         "仍在使用 PID 拼接的临时文件名")
+        self.assertNotIn("siwx_db_{os.getpid()}", code,
+                         "仍在使用 PID 拼接的临时文件名")
+        self.assertIn("mkstemp", code)
+
+
+# ── 数据安全修复：同名账号冲突检测（方案 C）────────────────────
+
+class TestAccountConflicts(unittest.TestCase):
+
+    def test_detects_duplicate_wxid(self):
+        from siwx.discover import find_account_conflicts
+        dirs = [
+            ("wxid_a", r"C:\x\wxid_a\db_storage"),
+            ("wxid_a", r"D:\x\wxid_a\db_storage"),
+            ("wxid_b", r"C:\x\wxid_b\db_storage"),
+        ]
+        conflicts = find_account_conflicts(dirs)
+        self.assertEqual(len(conflicts), 1)
+        self.assertEqual(conflicts[0]["wxid"], "wxid_a")
+        self.assertEqual(len(conflicts[0]["dirs"]), 2)
+
+    def test_no_conflict_returns_empty(self):
+        from siwx.discover import find_account_conflicts
+        dirs = [("wxid_a", r"C:\x\a\db_storage"),
+                ("wxid_b", r"C:\x\b\db_storage")]
+        self.assertEqual(find_account_conflicts(dirs), [])
+
+    def test_empty_input(self):
+        from siwx.discover import find_account_conflicts
+        self.assertEqual(find_account_conflicts([]), [])
+
+    def test_three_copies(self):
+        from siwx.discover import find_account_conflicts
+        dirs = [("w", "1"), ("w", "2"), ("w", "3")]
+        c = find_account_conflicts(dirs)
+        self.assertEqual(len(c), 1)
+        self.assertEqual(len(c[0]["dirs"]), 3)
+
+    def test_status_api_exposes_conflicts(self):
+        """/api/status 必须返回 conflicts 字段（前端据此提示）。"""
+        from siwx import server
+        client = server.app.test_client()
+        resp = client.get("/api/status")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("conflicts", resp.get_json())
+
+
+# ── 数据安全修复：manifest 来源保护（方案 B）──────────────────
+
+class TestManifestSourceGuard(TempRootCase):
+    """同名账号共用 output/<wxid>/ 时，来源变更不得静默覆盖已存在产物。
+
+    核心兼容约束：旧 manifest 无 @source（升级自 v5.0.x）必须放行，
+    行为与旧版完全一致。
+    """
+
+    def setUp(self):
+        super().setUp()
+        from siwx import extract, keystore
+        from siwx import pool
+        self.extract, self.pool = extract, pool
+        self._bench = []
+        # 密钥依赖必须自给自足（吸收上游 f160d9d）：此前依赖开发者本机真实
+        # 密钥库，干净环境（CI）里 0 密钥，用例全在 _resolve_key 处因无候选
+        # 跳过（ok=0/conflicts=0）。这里 patch keystore.load 注入 salt→key，
+        # 不写真实密钥库（上游直接 insert/save 会污染开发机密钥库）。
+        self._ks_orig = keystore.load
+        keystore.load = lambda: {"aa" * 16: {"key": "ab" * 32,
+                                             "strategy": "test", "updated": 0}}
+        self._orig = (extract.parse_key, extract.verify_enc_key,
+                      extract.decrypt_parallel)
+        extract.parse_key = lambda k: b"\x00" * 32
+        extract.verify_enc_key = lambda kb, p1: True
+
+        def fake_parallel(tasks, workers=None, on_done=None):
+            res = []
+            for rel, src, dst, key_hex in tasks:
+                Path(dst).parent.mkdir(parents=True, exist_ok=True)
+                Path(dst).write_bytes(b"DECRYPTED")
+                r = (rel, 2, "ok", "")
+                res.append(r)
+                if on_done:
+                    on_done(r)
+            return res
+
+        extract.decrypt_parallel = fake_parallel
+        self._bench.append(fake_parallel)
+
+    def tearDown(self):
+        from siwx import keystore
+        (self.extract.parse_key, self.extract.verify_enc_key,
+         self.extract.decrypt_parallel) = self._orig
+        keystore.load = self._ks_orig
+        super().tearDown()
+
+    def _entry(self, rel, path, size=8192):
+        from siwx.sqlcipher import DbEntry
+        return DbEntry(rel, Path(path), size, "aa" * 16, b"\x00" * 4096)
+
+    def _make_dirs(self):
+        c = self.tmp / "c" / "wxid_t" / "db_storage"
+        d = self.tmp / "d" / "wxid_t" / "db_storage"
+        for base in (c, d):
+            (base / "contact").mkdir(parents=True, exist_ok=True)
+            (base / "contact" / "contact.db").write_bytes(b"x" * 8192)
+        return c, d
+
+    def test_upgrade_without_source_field_is_allowed(self):
+        """升级场景：旧 manifest 无 @source -> 放行（关键兼容性保证）。"""
+        c, d = self._make_dirs()
+        out = self.tmp / "out" / "wxid_t"
+        (out / "contact").mkdir(parents=True, exist_ok=True)
+        (out / "contact" / "contact.db").write_bytes(b"LEGACY")
+
+        # 模拟 v5.0.2 的 manifest：只有业务键，没有 @source
+        self.pool.save_manifest(out, {
+            os.path.join("contact", "contact.db"): {"size": 1, "mtime": 1, "pages": 1,
+                                    "key": "ab" * 32}})
+
+        entries = [self._entry(os.path.join("contact", "contact.db"), d / "contact" / "contact.db")]
+        rep = self.extract.decrypt_dir(str(d), str(out), log=lambda m: None,
+                                      entries=entries, use_cache=True)
+        self.assertEqual(rep["conflicts"], 0, "升级用户不应被拦截")
+        self.assertEqual(rep["ok"], 1)
+
+    def test_source_change_blocks_overwrite(self):
+        """来源变更 + 产物存在 -> 跳过，内容不变。"""
+        c, d = self._make_dirs()
+        out = self.tmp / "out" / "wxid_t"
+        (out / "contact").mkdir(parents=True, exist_ok=True)
+        target = out / "contact" / "contact.db"
+        target.write_bytes(b"PROTECT-ME")
+
+        self.pool.save_manifest(out, {
+            self.extract.SOURCE_FIELD: str(c.resolve()).casefold()})
+
+        entries = [self._entry(os.path.join("contact", "contact.db"), d / "contact" / "contact.db")]
+        rep = self.extract.decrypt_dir(str(d), str(out), log=lambda m: None,
+                                      entries=entries, use_cache=True)
+        self.assertEqual(rep["conflicts"], 1)
+        self.assertEqual(target.read_bytes(), b"PROTECT-ME",
+                         "其他副本的产物被覆盖了")
+
+    def test_same_source_allows_decrypt(self):
+        """来源一致 -> 正常解密。"""
+        c, d = self._make_dirs()
+        out = self.tmp / "out" / "wxid_t"
+        (out / "contact").mkdir(parents=True, exist_ok=True)
+        (out / "contact" / "contact.db").write_bytes(b"OLD")
+
+        self.pool.save_manifest(out, {
+            self.extract.SOURCE_FIELD: str(d.resolve()).casefold()})
+
+        entries = [self._entry(os.path.join("contact", "contact.db"), d / "contact" / "contact.db")]
+        rep = self.extract.decrypt_dir(str(d), str(out), log=lambda m: None,
+                                      entries=entries, use_cache=True)
+        self.assertEqual(rep["conflicts"], 0)
+        self.assertEqual(rep["ok"], 1)
+
+    def test_writes_source_when_absent(self):
+        """无历史来源且成功解密后，必须写入 @source。"""
+        c, d = self._make_dirs()
+        out = self.tmp / "out" / "wxid_t"
+        (out / "contact").mkdir(parents=True, exist_ok=True)
+
+        entries = [self._entry(os.path.join("contact", "contact.db"), d / "contact" / "contact.db")]
+        self.extract.decrypt_dir(str(d), str(out), log=lambda m: None,
+                                entries=entries, use_cache=True)
+        m = self.pool.load_manifest(out)
+        self.assertEqual(m.get(self.extract.SOURCE_FIELD),
+                         str(d.resolve()).casefold())
+
+    def test_no_conflict_when_no_existing_artifact(self):
+        """来源变更但无产物 -> 不拦截。"""
+        c, d = self._make_dirs()
+        out = self.tmp / "out" / "wxid_t"
+        (out / "contact").mkdir(parents=True, exist_ok=True)   # 目录在，文件不在
+        self.pool.save_manifest(out, {
+            self.extract.SOURCE_FIELD: str(c.resolve()).casefold()})
+
+        entries = [self._entry(os.path.join("contact", "contact.db"), d / "contact" / "contact.db")]
+        rep = self.extract.decrypt_dir(str(d), str(out), log=lambda m: None,
+                                      entries=entries, use_cache=True)
+        self.assertEqual(rep["conflicts"], 0)
+        self.assertEqual(rep["ok"], 1)
+
+    def test_source_field_coexists_with_business_keys(self):
+        """@source 与业务键混存不互相干扰。"""
+        out = self.tmp / "out" / "wxid_t"
+        out.mkdir(parents=True)
+        self.pool.save_manifest(out, {
+            os.path.join("contact", "contact.db"): {"size": 1, "mtime": 1, "pages": 1,
+                                    "key": "ab" * 32},
+            self.extract.SOURCE_FIELD: "d:\\x"})
+        m = self.pool.load_manifest(out)
+        self.assertEqual(len(m), 2)
+        self.assertIn(os.path.join("contact", "contact.db"), m)
+        self.assertEqual(m.get(self.extract.SOURCE_FIELD), "d:\\x")
+
+    def test_report_includes_conflicts_count(self):
+        """report 必须带 conflicts 字段（供上层/日志展示）。"""
+        c, d = self._make_dirs()
+        out = self.tmp / "out" / "wxid_t"
+        (out / "contact").mkdir(parents=True, exist_ok=True)
+        rep = self.extract.decrypt_dir(str(d), str(out), log=lambda m: None,
+                                      entries=[], use_cache=True)
+        self.assertIn("conflicts", rep)
+
+
+class TestDisclaimerSync(unittest.TestCase):
+    """免责声明双源同步：README 与控制台弹层（ui/pages/disclaimer.html）必须一致。
+
+    免责条款改写时两处必须同步更新，避免「文档说一套、应用里另一套」。
+    若调整哨兵条款的措辞，请同步修改本测试。
+    """
+
+    README = ROOT / "README.md"
+    UI_DISCLAIMER = ROOT / "siwx" / "ui" / "pages" / "disclaimer.html"
+
+    def test_ui_disclaimer_file_exists(self):
+        self.assertTrue(self.UI_DISCLAIMER.is_file(),
+                        "缺少 siwx/ui/pages/disclaimer.html（控制台免责弹层全文）")
+
+    def test_key_clauses_present_in_both_sources(self):
+        readme = self.README.read_text(encoding="utf-8")
+        ui = self.UI_DISCLAIMER.read_text(encoding="utf-8")
+        for phrase in (
+            "技术研究与个人数据管理工具",
+            "数据权属合法",
+            "取得必要授权",
+            "账号被平台限制或封禁",
+            "世界多数国家和地区",
+            "AS IS",
+            "明文或不完全加密",
+            "接入 AI 客户端前自行评估",
+            "本声明不修改、不限制 AGPL-3.0 已授予的权利",
+            "商用支持需另行授权",
+            "可分割性与更新",
+        ):
+            self.assertIn(phrase, readme, f"README 免责声明缺少关键条款：{phrase}")
+            self.assertIn(phrase, ui, f"应用内免责声明缺少关键条款：{phrase}")
+
+    def test_consent_gate_wired_into_shell(self):
+        """免责声明接线：向导第 1 步承担首启确认（含 ack 状态），设置页承担常驻全文入口。"""
+        app_js = (ROOT / "siwx" / "ui" / "app.js").read_text(encoding="utf-8")
+        self.assertIn("DISCLAIMER_VERSION", app_js, "app.js 缺少免责条款版本常量")
+        self.assertIn("siwx-disclaimer-ack", app_js, "app.js 未接入确认状态（localStorage）")
+        self.assertIn("/pages/disclaimer.html", app_js, "app.js 未加载免责声明全文")
+        onboarding_js = (ROOT / "siwx" / "ui" / "onboarding.js").read_text(encoding="utf-8")
+        self.assertIn("/pages/disclaimer.html", onboarding_js, "首启向导缺少免责声明步骤")
+        self.assertIn("siwx-disclaimer-ack", onboarding_js, "首启向导未写入声明确认状态")
+        settings_html = (ROOT / "siwx" / "ui" / "pages" / "settings.html").read_text(encoding="utf-8")
+        self.assertIn('id="s-view-disclaimer"', settings_html, "设置页缺少免责声明查看入口")
+
+
+# ── 12. 同秒消息分页游标（create_time + local_id 组合游标）──────────
+
+class TestSameSecondPagination(TempRootCase):
+    """向上翻页原来只按 `create_time < before` 取数：翻页边界落在同一秒的
+    一批消息中间时，剩余同秒消息会被永久跳过。升级为 (create_time,
+    local_id) 组合游标后必须能全部翻出；只传 before 时保持旧语义。"""
+
+    def _make_same_second_account(self):
+        acc, account, chat = make_account(self.tmp, n_texts=0)
+        db = acc / "message" / "message_0.db"
+        t = _msg_table(chat)
+        conn = sqlite3.connect(db)
+        # ts=100 同秒 4 条（id 1~4，新→旧写入），ts=50 两条（id 5~6）
+        for lid, ts in [(1, 100), (2, 100), (3, 100), (4, 100), (5, 50), (6, 50)]:
+            content = f"消息 {lid}".encode("utf-8")
+            conn.execute(f"INSERT INTO [{t}] VALUES (?,?,?,?,?,?,?,?)",
+                         (lid, 1000 + lid, 1, ts, 0, 1, content, None))
+        conn.commit()
+        conn.close()
+        api_chat._SHARD_INDEX.clear()
+        return account, chat
+
+    def test_same_second_messages_are_not_skipped(self):
+        from siwx.server import app
+        account, chat = self._make_same_second_account()
+        client = app.test_client()
+        base = f"/api/chat/messages?account={account}&chat={chat}&limit=3"
+
+        page1 = client.get(base).get_json()
+        self.assertEqual([m["id"] for m in page1["messages"]], [2, 3, 4])
+        self.assertTrue(page1["has_more"])
+
+        cursor = page1["messages"][0]
+        url = (f"{base}&before={cursor['ts']}&before_id={cursor['id']}")
+        page2 = client.get(url).get_json()
+        # 修复前：before=100 只按 `ts < 100` 取 → id=1（同秒）永久丢失
+        self.assertEqual(sorted(m["id"] for m in page2["messages"]), [1, 5, 6])
+        self.assertFalse(page2["has_more"])
+
+    def test_legacy_before_only_cursor_still_works(self):
+        from siwx.server import app
+        account, chat = self._make_same_second_account()
+        client = app.test_client()
+        page = client.get(
+            f"/api/chat/messages?account={account}&chat={chat}&limit=10&before=100"
+        ).get_json()
+        self.assertEqual(sorted(m["id"] for m in page["messages"]), [5, 6])
+
+
+# ── 13. HTML 导出 </script> / <!-- 注入 ─────────────────────────
+
+class TestScriptSafeJson(unittest.TestCase):
+    """消息或会话名含 </script> 会提前闭合 window.CHAT_DATA 的 script
+    标签，导出的自包含网页损坏；含 <!-- 则令 script 进入双转义状态、
+    模板写出的闭标签被吞。两者都必须转义。"""
+
+    def test_closing_script_is_escaped(self):
+        from siwx.html_template import render_html
+        data = self._chat_data("</script><script>alert(1)</script>")
+        html = render_html(data)
+        blob = html.split("window.CHAT_DATA = ", 1)[1]
+        # script 体里不允许再出现原始的 </script>（闭标签只有模板自己写的）
+        body = blob[:blob.rindex(";</script>")]
+        self.assertNotIn("</script>", body)
+        import json
+        self.assertEqual(json.loads(blob[:blob.index(";</script>")])
+                         ["meta"]["sessionName"],
+                         "</script><script>alert(1)</script>")
+
+    def test_html_comment_is_escaped(self):
+        # 只转义 </ 不转 <!-- 等于没修：<!-- 叠加 <script> 会令 HTML
+        # 解析器吞掉模板写出的闭标签
+        from siwx.html_template import render_html
+        import json
+        data = self._chat_data("<!--")
+        html = render_html(data)
+        blob = html.split("window.CHAT_DATA = ", 1)[1]
+        self.assertEqual(json.loads(blob[:blob.index(";</script>")])
+                         ["meta"]["sessionName"], "<!--")
+
+    @staticmethod
+    def _chat_data(name):
+        from siwx.html_template import build_chat_data
+        msgs = [{
+            "createTime": 1, "senderUsername": "a", "senderDisplayName": "A",
+            "localType": 1, "content": name, "rawContent": name, "isSend": 0,
+        }]
+        session = {"wxid": "room", "displayName": name, "isGroup": False,
+                   "firstTimestamp": 1, "lastTimestamp": 1, "ownerId": "o",
+                   "messageCount": 1}
+        return build_chat_data(session, msgs, {})
+
+
+# ── 14. pack="zip" 后 file 字段死链 ─────────────────────────────
+
+class TestZipPackFileDeadLink(TempRootCase):
+    """run_export 打包 zip 后删除整个导出目录，但返回值 file 仍指向
+    目录内已删除的文件。「每会话一个 ZIP」（pack="each" → 每会话
+    run_export(pack="zip")）模式下前端拿它渲染"下载文件"链接，点击
+    必然 404。打包后 file 必须置空。"""
+
+    def test_zip_pack_file_is_none_and_zip_exists(self):
+        acc, account, chat = make_account(self.tmp)
+        from siwx.exporter import run_export
+        res = run_export(acc, account, chat, "联系人B", "json",
+                         export_root=self.tmp / "exports", pack="zip")
+        self.assertIsNone(res["file"], "zip 打包删除目录后 file 不应再指向死路径")
+        self.assertTrue(Path(res["zip"]).is_file())
+        # 不打包时 file 正常返回
+        res2 = run_export(acc, account, chat, "联系人B", "json",
+                          export_root=self.tmp / "exports", pack="none")
+        self.assertTrue(Path(res2["file"]).is_file())
+
+
+# ── 15. is_me 判定的账号目录名解析 ──────────────────────────────
+
+class TestOwnerBase(TempRootCase):
+    """is_me 依赖"从账号目录名 wxid_xxx_<uin> 推断本人原始 wxid"。
+    原实现 split("_6")[0] 赌 uin 以 6 开头、且是任意子串匹配：
+    uin 不以 6 开头时 is_me 全灭；wxid 本体含 6 开头段（如
+    wxid_6abc_6001）时直接得到 "wxid"。也不能改用 media.clean_wxid()
+    ——它对 wxid_a_b_1234 会切错，且语义被 MMKV 密钥派生依赖。"""
+
+    def test_owner_base_matrix(self):
+        from siwx.api_chat import owner_base
+        cases = [
+            ("wxid_abc_6001", "wxid_abc"),      # 常规：uin 以 6 开头
+            ("wxid_abc_123456", "wxid_abc"),    # uin 不以 6 开头（旧实现切错）
+            ("wxid_a_b_1234", "wxid_a_b"),      # wxid 本体含下划线
+            ("wxid_6abc_6001", "wxid_6abc"),    # wxid 本体含 6 开头段
+            ("my_custom_id", "my_custom_id"),   # 自定义账号 ID（无数字后缀）
+            ("wxid_abc", "wxid_abc"),           # 无 uin 后缀
+            ("", ""),
+            (None, ""),
+        ]
+        for inp, want in cases:
+            self.assertEqual(owner_base(inp), want, f"owner_base({inp!r})")
+
+    def test_is_me_uses_owner_base(self):
+        # uin 不以 6 开头的账号目录，自己发的消息 is_me / isSend 必须正确
+        acc, account, chat = make_account(self.tmp, account="wxid_me_123456",
+                                          chat="wxid_demo_b")
+        db = acc / "message" / "message_0.db"
+        t = _msg_table(chat)
+        conn = sqlite3.connect(db)
+        content = "wxid_me_123456:\n自己发的消息".encode("utf-8")
+        conn.execute(f"INSERT INTO [{t}] VALUES (?,?,?,?,?,?,?,?)",
+                     (999, 1999, 1, 1_700_000_500, 1, None, content, None))
+        conn.commit()
+        conn.close()
+        api_chat._SHARD_INDEX.clear()
+        from siwx.export_stream import message_stream
+        msgs = list(message_stream(acc, chat, account=account))
+        mine = [m for m in msgs if m["localId"] == 999]
+        self.assertTrue(mine and mine[0]["isSend"] == 1,
+                        "uin 不以 6 开头时 is_me 判定失败")
+
+
+# ── 16. 引用消息（外层 49、内层 57）──────────────────────────────
+
+_QUOTE_49_XML = (
+    '<appmsg type="57"><title><![CDATA[这是回复文本]]></title><type>57</type>'
+    '<refermsg><displayname><![CDATA[张三]]></displayname>'
+    '<content><![CDATA[被引用的原话]]></content>'
+    '<createtime>1700000000</createtime></refermsg></appmsg>')
+_LINK_49_XML = ('<appmsg type="5"><title>文章标题</title>'
+                '<url>https://example.com/a</url><des>摘要</des></appmsg>')
+
+
+class TestQuoteInType49(TempRootCase):
+    """微信 5.0 库里引用消息外层 local_type=49、引用信息在内层 <refermsg>；
+    原实现只在外层 57 时解析 → quote 恒为 null（实测 0/31437 条）。修复后
+    49 + refermsg 必须走引用分支：quote 有值、link 为空、content 为纯回复
+    文本；真链接消息（49 无 refermsg）不受影响。"""
+
+    def _make(self):
+        # 每个用例独立的子目录，避免 make_shard 重复建表冲突
+        acc, account, chat = make_account(self.tmp / self._testMethodName,
+                                          n_texts=0)
+        db = acc / "message" / "message_0.db"
+        t = _msg_table(chat)
+        conn = sqlite3.connect(db)
+        conn.execute(f"INSERT INTO [{t}] VALUES (?,?,?,?,?,?,?,?)",
+                     (1, 1001, 49, 1_700_000_100, 0, None,
+                      _QUOTE_49_XML.encode("utf-8"), None))
+        conn.execute(f"INSERT INTO [{t}] VALUES (?,?,?,?,?,?,?,?)",
+                     (2, 1002, 49, 1_700_000_200, 0, None,
+                      _LINK_49_XML.encode("utf-8"), None))
+        conn.commit()
+        conn.close()
+        api_chat._SHARD_INDEX.clear()
+        return acc, account, chat
+
+    def test_type49_with_refermsg_yields_quote(self):
+        from siwx.export_stream import message_stream
+        acc, account, chat = self._make()
+        msgs = list(message_stream(acc, chat, account=account))
+        q = next(m for m in msgs if m["localId"] == 1)
+        self.assertIsNotNone(q["quote"])
+        self.assertEqual(q["quote"]["displayname"], "张三")
+        self.assertEqual(q["quote"]["content"], "被引用的原话")
+        self.assertEqual(q["quote"]["ts"], 1700000000)
+        self.assertIsNone(q["link"])
+        self.assertEqual(q["content"], "这是回复文本")
+
+    def test_type49_link_still_works(self):
+        from siwx.export_stream import message_stream
+        acc, account, chat = self._make()
+        msgs = list(message_stream(acc, chat, account=account))
+        lk = next(m for m in msgs if m["localId"] == 2)
+        self.assertIsNone(lk["quote"])
+        self.assertIsNotNone(lk["link"])
+        self.assertEqual(lk["link"]["title"], "文章标题")
+        self.assertEqual(lk["content"], "[链接] 文章标题")
+
+    def test_build_messages_quote_for_web(self):
+        acc, account, chat = self._make()
+        data = api_chat.build_messages(acc, chat, account=account)
+        q = next(m for m in data if m["localId"] == 1)
+        self.assertIsNotNone(q["quote"])
+        self.assertEqual(q["quote"]["displayname"], "张三")
+        self.assertEqual(q["kind"], "quote")
+
+    def test_html_renderer_shows_quote_not_undefined(self):
+        from siwx.html_template import build_chat_data, render_html
+        from siwx.export_stream import message_stream
+        acc, account, chat = self._make()
+        msgs = list(message_stream(acc, chat, account=account))
+        session = {"wxid": chat, "displayName": "测试", "isGroup": False,
+                   "firstTimestamp": 1, "lastTimestamp": 2, "ownerId": "o",
+                   "messageCount": len(msgs)}
+        html = render_html(build_chat_data(session, msgs, {}))
+        self.assertIn('class="msg-quote"', html)
+        self.assertIn("张三", html)
+        self.assertIn("这是回复文本", html)
+        blob = html.split("window.CHAT_DATA = ", 1)[1]
+        self.assertNotIn("undefined", blob.split(";</script>")[0])
+
+
+# ── 17. 媒体回填类型门禁（跨分片 local_id 撞号）──────────────────
+
+class TestMediaAttachTypeGate(unittest.TestCase):
+    """媒体映射以 (md5, localId, ts) 组合键为索引（语音为 (\x00voice, localId, ts)），
+    多分片会话的 local_id 独立编号会撞号：文本/链接/系统消息不能被挂上属于
+    其它消息的 mediaFile（实测 885 条）；跨分片同 localId 的图片之间由 md5
+    区分（真实库 19210 个撞号键 / 350 会话）；图片槽位与语音槽位互斥。
+    所有回填点必须走 _attach_media 门禁。"""
+
+    MEDIA_MAP = {
+        ("abc123", 5, 100): "media/0001_abc.jpg",
+        ("def456", 5, 200): "media/0002_def.jpg",       # 同 localId 不同 md5
+        ("\x00voice", 7, 300): "media/voice_0003_7.wav",
+    }
+
+    def _attach(self, msg):
+        from siwx.exporter import _attach_media
+        msg = dict(msg)
+        _attach_media(msg, self.MEDIA_MAP)
+        return msg.get("mediaFile")
+
+    def test_gate_matrix(self):
+        cases = [
+            ({"localId": 5, "localType": 1, "md5": "abc123", "createTime": 100}, None),      # 文本撞号 → 不挂
+            ({"localId": 5, "localType": 49, "md5": "abc123", "createTime": 100}, None),     # 链接撞号 → 不挂
+            ({"localId": 5, "localType": 10000, "md5": "abc123", "createTime": 100}, None),  # 系统消息 → 不挂
+            ({"localId": 5, "localType": 3, "md5": "abc123", "createTime": 100}, "media/0001_abc.jpg"),
+            ({"localId": 5, "localType": 47, "md5": "abc123", "createTime": 100}, "media/0001_abc.jpg"),
+            # 组合键根治跨分片互挂：同 localId、不同 md5 → 各挂各的图
+            ({"localId": 5, "localType": 3, "md5": "def456", "createTime": 200}, "media/0002_def.jpg"),
+            ({"localId": 7, "localType": 34, "createTime": 300}, "media/voice_0003_7.wav"),
+            ({"localId": 7, "localType": 3, "createTime": 300}, None),      # 图片消息撞语音键 → 不挂
+            ({"localId": 9, "localType": 3, "md5": "abc123", "createTime": 100}, None),      # 键不存在 → 不挂
+            ({"localId": 5, "localType": 3, "md5": "abc123"}, None),        # ts 缺失 → 键不匹配 → 不挂
+        ]
+        for msg, want in cases:
+            self.assertEqual(self._attach(msg), want, msg)
+
+    def test_export_pipeline_logging_present(self):
+        """报告二.1：导出管线失败不得静默——分片/媒体失败与条数对账必须有日志，
+        且不允许绕过类型门禁的裸 get 回填。
+
+        （不回源码断言 `_attach_media` 的调用次数：合法新增回填点会让计数
+        变红，而它防不住任何真实缺陷。）
+        """
+        stream_src = (ROOT / "siwx" / "export_stream.py").read_text(encoding="utf-8")
+        self.assertIn("分片打开失败", stream_src)
+        exporter_src = (ROOT / "siwx" / "exporter.py").read_text(encoding="utf-8")
+        self.assertIn("处理失败", exporter_src)
+        self.assertIn("条数对账不一致", exporter_src)
+        self.assertNotIn('msg["mediaFile"] = media_map.get', exporter_src)
+
+
+# ── 18. _fmt 剥离 CDATA ─────────────────────────────────────────
+
+class TestFmtCdataStrip(unittest.TestCase):
+    """type 49 截取 <title> 时不剥 CDATA → content 出现 <![CDATA[...]]> 原文
+    （实测某会话 835 条链接消息中 45 条含 CDATA）；引用消息（外层 49）的
+    content 也不应带 "[链接]" 前缀。"""
+
+    def test_link_title_cdata_stripped(self):
+        from siwx.api_chat import _fmt
+        self.assertEqual(
+            _fmt(49, "<appmsg><title><![CDATA[标题A]]></title></appmsg>"),
+            "[链接] 标题A")
+
+    def test_quote_title_cdata_stripped(self):
+        from siwx.api_chat import _fmt
+        self.assertEqual(
+            _fmt(57, "<msg><title><![CDATA[回复B]]></title></msg>"), "回复B")
+
+    def test_refermsg_49_content_is_plain_title(self):
+        from siwx.api_chat import _fmt
+        self.assertEqual(_fmt(49, _QUOTE_49_XML), "这是回复文本")
+
+
+# ── 19. 日志脱敏（键值对账号标识 + get_logs 默认脱敏）────────────
+
+class TestLogDesensitize(unittest.TestCase):
+    """报告二.3：脱敏此前只在 export_logs 生效；wxid/gh 之外的自定义微信号
+    （如 wxalias_xxx）不在任何规则内。现在 get_logs 默认脱敏、日志页统一
+    脱敏、新增键值对账号标识规则。"""
+
+    def test_custom_account_kv_masked(self):
+        from siwx.logger import desensitize_msg
+        out = desensitize_msg(
+            "[msg] 查询消息: account=wxalias_abc12345, chat=wxid_secret999")
+        self.assertNotIn("wxalias_abc12345", out)
+        self.assertIn("account=wxal***", out)
+        self.assertNotIn("wxid_secret999", out)
+        self.assertIn("wxid_***", out)
+
+    def test_desensitize_idempotent(self):
+        from siwx.logger import desensitize_msg
+        once = desensitize_msg("account=wxalias_abc12345 key=" + "ab" * 32)
+        twice = desensitize_msg(once)
+        self.assertEqual(once, twice)
+
+    def test_get_logs_desensitized_by_default(self):
+        from siwx import logger as _logger
+        _logger.rough("test", "chat=wxid_secret999 account=wxalias_abc12345")
+        entries = _logger.get_logs(limit=10)
+        text = " ".join(e[3] for e in entries)
+        self.assertNotIn("wxid_secret999", text)
+        self.assertNotIn("wxalias_abc12345", text)
+
+    def test_log_page_and_settings_wired(self):
+        server_src = (ROOT / "siwx" / "server.py").read_text(encoding="utf-8")
+        self.assertIn("_desensitize_item", server_src)
+        # 级别切换的双通道同步已抽到 siwx/loglevel.py（审计 §2.3 持久化改造）
+        self.assertIn("_loglevel.apply", server_src)
+        loglevel_src = (ROOT / "siwx" / "loglevel.py").read_text(encoding="utf-8")
+        self.assertIn('logging.getLogger("siwx").setLevel', loglevel_src)
+
+
+# ── 20. 日志级别切换：开关只控展示，文件通道恒 DEBUG ────────────
+
+class TestLogLevelSwitchAffectsFileLog(_TempAppDirsCase):
+    """P0 留存改造后的语义：detailed 埋点始终写 siwx.log（文件通道恒
+    DEBUG），"先开 Debug 再复现"的范式废弃——偶发问题事后可在文件里找到
+    当时记录。开关只控制环形缓冲/UI 展示（logger.get_level）。"""
+
+    def test_file_channel_stays_debug_in_both_modes(self):
+        import logging as stdlib_logging
+        from siwx.server import app
+        c = app.test_client()
+        c.post("/api/logs/settings", json={"level": "detailed"})
+        self.assertEqual(stdlib_logging.getLogger("siwx").level,
+                         stdlib_logging.DEBUG)
+        c.post("/api/logs/settings", json={"level": "rough"})
+        # 关键回归点：ROUGH 模式文件通道仍是 DEBUG（此前这里断言 INFO，
+        # P0 后该断言反向——若回到 INFO，detailed 落盘会被整体掐掉）
+        self.assertEqual(stdlib_logging.getLogger("siwx").level,
+                         stdlib_logging.DEBUG)
+
+    def test_switch_still_controls_ring_level(self):
+        from siwx import logger as _logger
+        from siwx.server import app
+        c = app.test_client()
+        c.post("/api/logs/settings", json={"level": "detailed"})
+        self.assertEqual(_logger.get_level(), _logger.LogLevel.DETAILED)
+        c.post("/api/logs/settings", json={"level": "rough"})
+        self.assertEqual(_logger.get_level(), _logger.LogLevel.ROUGH)
+
+
+# ── 21. 引用解析修复（审计 v2.1 D1/D2/D3/D7/D8）────────────────
+
+class TestParseReferHardening(unittest.TestCase):
+    """_parse_refer 健壮性：D1 容忍属性、D7 空 content 不崩溃、
+    D8 实体转义还原、D2/D3 精确类型开关。"""
+
+    def test_d7_empty_content_no_crash(self):
+        """refermsg 无 <content> / content 为空：此前对 None 做 re.search
+        抛 TypeError（真实库 182 条，整会话导出失败 / 聊天页 500）。"""
+        from siwx.api_chat import _parse_refer, parse_quote_or_link
+        xml = ('<appmsg><title>回复</title><refermsg>'
+               '<displayname>张三</displayname><createtime>1</createtime>'
+               '</refermsg></appmsg>')
+        q = _parse_refer(xml)
+        self.assertIsNotNone(q)
+        self.assertEqual(q["content"], "")
+        # 空 content 且全空 text 也不崩溃
+        self.assertIsNone(_parse_refer(""))
+        self.assertIsNone(parse_quote_or_link(49, "<other/>")[0])
+
+    def test_d1_refermsg_with_attributes(self):
+        """<refermsg type="3"> 带属性形态：引用关系不再静默丢失。"""
+        from siwx.api_chat import has_refermsg, _parse_refer
+        xml = ('<appmsg><title>回复</title>'
+               '<refermsg type="3" svrid="123">'
+               '<displayname>张三</displayname>'
+               '<content>&lt;msg&gt;&lt;img aeskey="k"/&gt;&lt;/msg&gt;</content>'
+               '<createtime>1700000000</createtime></refermsg></appmsg>')
+        self.assertTrue(has_refermsg(xml))
+        q = _parse_refer(xml)
+        self.assertIsNotNone(q)
+        self.assertEqual(q["displayname"], "张三")
+        self.assertEqual(q["content"], "[图片]")   # type=3 精确开关
+        self.assertEqual(q["ts"], 1700000000)
+
+    def test_d8_entity_escaped_nested_xml(self):
+        """嵌套 XML 以 HTML 实体存储：quote.content 不再是 &lt;title&gt; 字面量
+        （真实库 7358 条 / 23% 的"引用乱码"根因）。"""
+        from siwx.api_chat import _parse_refer
+        inner = ('&lt;msg&gt;&lt;appmsg&gt;&lt;title&gt;被引用的链接标题'
+                 '&lt;/title&gt;&lt;/appmsg&gt;&lt;/msg&gt;')
+        xml = ('<appmsg><title>回复</title><refermsg>'
+               '<displayname>张三</displayname>'
+               f'<content>{inner}</content>'
+               '<createtime>1</createtime></refermsg></appmsg>')
+        q = _parse_refer(xml)
+        self.assertEqual(q["content"], "被引用的链接标题")
+
+    def test_d3_video_refer_label(self):
+        """引用视频：不再把嵌套 XML 原文直出，按 type=43 给 [视频]。"""
+        from siwx.api_chat import _parse_refer
+        xml = ('<refermsg><displayname>李四</displayname>'
+               '<content>&lt;msg&gt;&lt;videomsg aeskey="v"/&gt;&lt;/msg&gt;</content>'
+               '<type>43</type></refermsg>')
+        q = _parse_refer(xml)
+        self.assertEqual(q["content"], "[视频]")
+
+    def test_d2_no_loose_regex_misjudge(self):
+        """datatype="3" 等子串不再误判为图片：refermsg type 全等才给 [图片]。"""
+        from siwx.api_chat import _parse_refer
+        inner = ('&lt;recordinfo&gt;&lt;dataitem datatype="3"&gt;x'
+                 '&lt;/dataitem&gt;&lt;/recordinfo&gt;')
+        xml = ('<refermsg><displayname>群</displayname>'
+               f'<content>{inner}</content>'
+               '<type>19</type></refermsg>')
+        q = _parse_refer(xml)
+        self.assertEqual(q["content"], "[聊天记录]")
+
+    def test_export_stream_no_bare_refermsg_check(self):
+        """export_stream 不再使用 "<refermsg>" 裸包含判断（D1 三处同步）。"""
+        es_src = (ROOT / "siwx" / "export_stream.py").read_text(encoding="utf-8")
+        self.assertNotIn('if "<refermsg>" in text', es_src)
+
+
+# ── 22. 合并转发热解析（审计 D5）───────────────────────────────
+
+class TestRecordinfoParsing(unittest.TestCase):
+    """appmsg type=19 合并转发：逐条 dataitem 热解析，不再整包丢弃
+    （真实库 2252 条 / 1206 条 datadesc 丢弃）。"""
+
+    XML = ('<appmsg type="19"><title>张三和李四的聊天记录</title><recordinfo>'
+           '<dataitem datatype="1" dataid="1"><sourcename>张三</sourcename>'
+           '<sourcetime>1700000001</sourcetime>'
+           '<datadesc><![CDATA[你好]]></datadesc></dataitem>'
+           '<dataitem datatype="2" dataid="2"><sourcename>李四</sourcename>'
+           '<sourcetime>1700000002</sourcetime>'
+           '<datadesc><![CDATA[[图片]]></datadesc></dataitem>'
+           '<dataitem datatype="1" dataid="3"><sourcename>张三</sourcename>'
+           '<sourcetime>1700000001</sourcetime>'
+           '<datadesc><![CDATA[你好]]></datadesc></dataitem>'
+           '</recordinfo></appmsg>')
+
+    def test_parse_recordinfo_items(self):
+        from siwx.api_chat import _parse_recordinfo
+        rec = _parse_recordinfo(self.XML)
+        self.assertEqual(rec["title"], "张三和李四的聊天记录")
+        # 非相邻的合法重复（同图连发两次）不再被全局去重折叠（微信原样显示）
+        self.assertEqual(rec["count"], 3)
+        self.assertEqual(rec["items"][0]["sender"], "张三")
+        self.assertEqual(rec["items"][0]["text"], "你好")
+        self.assertEqual(rec["items"][0]["time"], "")   # epoch sourcetime → 走 ts
+        self.assertEqual(rec["items"][0]["ts"], 1700000001)
+
+    def test_parse_recordinfo_adjacent_dedup(self):
+        """仅紧邻的完全重复折叠（防解析瑕疵双计）。"""
+        from siwx.api_chat import _parse_recordinfo
+        xml = ('<appmsg type="19"><title>t</title><recordinfo>'
+               '<dataitem datatype="1"><sourcename>a</sourcename>'
+               '<sourcetime>1</sourcetime><datadesc><![CDATA[x]]></datadesc></dataitem>'
+               '<dataitem datatype="1"><sourcename>a</sourcename>'
+               '<sourcetime>1</sourcetime><datadesc><![CDATA[x]]></datadesc></dataitem>'
+               '</recordinfo></appmsg>')
+        self.assertEqual(_parse_recordinfo(xml)["count"], 1)
+
+    def test_parse_recordinfo_sourcetime_string(self):
+        """sourcetime 为 "YYYY-MM-DD HH:MM" 字符串（服务器端形态）不再丢时间。"""
+        from siwx.api_chat import _parse_recordinfo
+        xml = ('<appmsg type="19"><title>t</title><recordinfo>'
+               '<dataitem datatype="8" dataid="x"><sourcename>张三</sourcename>'
+               '<sourcetime>2025-12-20 19:47</sourcetime>'
+               '<datatitle>资料.pdf</datatitle></dataitem>'
+               '</recordinfo></appmsg>')
+        it = _parse_recordinfo(xml)["items"][0]
+        self.assertEqual(it["ts"], 0)
+        self.assertEqual(it["time"], "2025-12-20 19:47")
+        self.assertEqual(it["text"], "资料.pdf")
+
+    def test_parse_recordinfo_server_side_des(self):
+        """服务器端合并记录（<type>19</type> 无 dataitem）→ des 逐行拆子消息。"""
+        from siwx.api_chat import _parse_recordinfo, _is_recordinfo, parse_quote_or_link
+        xml = ('<?xml version="1.0"?>\n<msg>\n<appmsg appid="" sdkver="0">\n'
+               '\t<title>张三和李四的聊天记录</title>\n'
+               '\t<des>张三: 你好呀\n李四: [图片]\n没有冒号的行</des>\n'
+               '\t<type>19</type>\n</appmsg></msg>')
+        self.assertTrue(_is_recordinfo(xml))
+        quote, link, record, _ch = parse_quote_or_link(49, xml)
+        self.assertIsNone(link)
+        self.assertIsNotNone(record)
+        self.assertEqual(record["title"], "张三和李四的聊天记录")
+        self.assertEqual([(i["sender"], i["text"]) for i in record["items"]],
+                         [("张三", "你好呀"), ("李四", "[图片]"), ("", "没有冒号的行")])
+
+    def test_fmt_49_recordinfo_summary(self):
+        from siwx.api_chat import _fmt
+        out = _fmt(49, self.XML)
+        self.assertTrue(out.startswith("[聊天记录] 张三和李四的聊天记录"))
+        self.assertIn("张三: 你好", out)
+        self.assertIn("3 条", out)
+
+    def test_fmt_49_file_label(self):
+        """带 fileext/totallen 的 49 是文件消息，content 前缀不再误标 [链接]。"""
+        from siwx.api_chat import _fmt
+        xml = ('<appmsg appid="" sdkver="0"><title>新建文档.docx</title>'
+               '<totallen>14260</totallen><fileext>docx</fileext></appmsg>')
+        out = _fmt(49, xml)
+        self.assertTrue(out.startswith("[文件]"), out)
+
+    def test_fmt_49_transfer_composite_label(self):
+        """packed_info 复合 localType（转账 8589934592049）不再标成 [链接]。"""
+        from siwx.api_chat import _fmt
+        out = _fmt(8589934592049,
+                   '<appmsg><title><![CDATA[转账给张三]]></title></appmsg>')
+        self.assertEqual(out, "[转账] 转账给张三")
+
+    def test_parse_quote_or_link_record(self):
+        from siwx.api_chat import parse_quote_or_link
+        quote, link, record, _ch = parse_quote_or_link(49, self.XML)
+        self.assertIsNone(quote)
+        self.assertIsNone(link)
+        self.assertIsNotNone(record)
+
+
+class TestFinderFeedParsing(unittest.TestCase):
+    """appmsg type=51 视频号卡片：findernamecard（转发名片）里带属性/自闭合
+    形态的 <nickname … /> 曾被 `<nickname[^>]*>` 前缀误当开标签，捕获组一路
+    吞到 <finderFeed> 深处真正的 </nickname>，整段 XML 进入展示字段——
+    聊天页"视频号 · "后面显示裸 XML。开标签必须止于空白或 `>` 且非自闭合。"""
+
+    # 合成结构：名片段的自闭合 nickname 在前，finderFeed 段的真昵称在后
+    XML = ('<msg><appmsg type="51"><title>当前版本不支持展示该内容</title>'
+           '<findernamecard>'
+           '<nickname alias="1" />'
+           '<avatar /><auth_job /><ecSource /><username />'
+           '</findernamecard>'
+           '<finderFeed>'
+           '<mediaList><media><mediaType>4</mediaType></media></mediaList>'
+           '<nickname>合成频道名</nickname>'
+           '<desc><![CDATA[合成视频描述]]></desc>'
+           '<duration>75</duration>'
+           '<objectNonceId>nonce_synthetic</objectNonceId>'
+           '</finderFeed>'
+           '</appmsg></msg>')
+
+    def test_nickname_not_polluted_by_self_closing_namecard_tag(self):
+        from siwx.api_chat import _parse_finder_feed
+        meta = _parse_finder_feed(self.XML)
+        self.assertIsNotNone(meta)
+        self.assertEqual(meta["nickname"], "合成频道名")
+        self.assertNotIn("<", meta["nickname"])
+        self.assertEqual(meta["desc"], "合成视频描述")
+        self.assertEqual(meta["duration"], 75)
+        self.assertEqual(meta["nonce"], "nonce_synthetic")
+
+    def test_nickname_with_attributes_still_parses(self):
+        """带属性的常规开标签（<nickname flag="2">名</nickname>）不受影响。"""
+        from siwx.api_chat import _parse_finder_feed
+        xml = ('<finderFeed><nickname flag="2">属性形态频道</nickname>'
+               '<desc>d</desc></finderFeed>')
+        self.assertEqual(_parse_finder_feed(xml)["nickname"], "属性形态频道")
+
+    def test_self_closing_alone_yields_empty_not_xml(self):
+        """只有自闭合 nickname、无真 </nickname> 时取不到就是空串，不吐 XML。"""
+        from siwx.api_chat import _parse_finder_feed
+        xml = '<finderFeed><nickname alias="1" /><avatar /><desc>d</desc></finderFeed>'
+        meta = _parse_finder_feed(xml)
+        self.assertEqual(meta["nickname"], "")
+
+    def test_parse_quote_or_link_channels_kind(self):
+        from siwx.api_chat import parse_quote_or_link, message_kind
+        quote, link, record, channels = parse_quote_or_link(49, self.XML)
+        self.assertIsNone(quote)
+        self.assertIsNone(link)
+        self.assertIsNone(record)
+        self.assertEqual(channels["nickname"], "合成频道名")
+        self.assertEqual(message_kind(49, quote, link, channels), "channels")
+        # content 文案取 finderFeed 的描述首行，而不是被污染的昵称
+        from siwx.api_chat import _fmt
+        self.assertEqual(_fmt(49, self.XML), "[视频号] 合成视频描述")
+
+
+class TestRecordinfoRefsAndMedia(unittest.TestCase):
+    """issue #31：合并转发子项的媒体引用、嵌套记录与原始消息回查。
+
+    此前子项只有文本占位（图片永远显示 "[图片]"），且 datatype=17 的嵌套
+    记录被当成普通文件丢弃。现在解析器保留 kind/title/srcMsgId 等字段，
+    并可用原始消息补全 md5——图片因此能走正常媒体链路导出。
+    """
+
+    XML = ('<appmsg type="19"><title>聊天记录</title><recordinfo>'
+           '<dataitem datatype="2" dataid="1"><sourcename>张三</sourcename>'
+           '<sourcetime>1700000001</sourcetime>'
+           '<datadesc><![CDATA[[图片]]></datadesc>'
+           '<fromnewmsgid>900001</fromnewmsgid>'
+           '<srcMsgLocalid>42</srcMsgLocalid>'
+           '<srcMsgCreateTime>1700000001</srcMsgCreateTime>'
+           '</dataitem>'
+           '<dataitem datatype="17" dataid="2"><sourcename>李四</sourcename>'
+           '<sourcetime>1700000002</sourcetime>'
+           '<recordinfo><title>嵌套记录</title><datalist count="1">'
+           '<dataitem datatype="1"><sourcename>王五</sourcename>'
+           '<sourcetime>1700000003</sourcetime>'
+           '<datadesc><![CDATA[嵌套文本]]></datadesc></dataitem>'
+           '</datalist></recordinfo></dataitem>'
+           '</recordinfo></appmsg>')
+
+    def test_kind_and_source_refs(self):
+        from siwx.api_chat import _parse_recordinfo
+        rec = _parse_recordinfo(self.XML)
+        img = rec["items"][0]
+        self.assertEqual(img["kind"], "image")
+        self.assertEqual(img["datatype"], "2")
+        self.assertEqual(img["srcMsgId"], 900001)
+        self.assertEqual(img["srcLocalId"], 42)
+        self.assertEqual(img["srcCreateTime"], 1700000001)
+
+    def test_nested_record_recurses(self):
+        from siwx.api_chat import _parse_recordinfo
+        nested = _parse_recordinfo(self.XML)["items"][1]
+        self.assertEqual(nested["kind"], "record")
+        self.assertIn("record", nested)
+        self.assertEqual(nested["record"]["title"], "嵌套记录")
+        self.assertEqual(nested["record"]["items"][0]["text"], "嵌套文本")
+
+    def test_resolve_many_fills_media(self):
+        from siwx.api_chat import _parse_recordinfo
+        calls = []
+
+        def resolve(ids):
+            calls.append(list(ids))
+            return {900001: {"md5": "a" * 32, "bubbleMd5": "", "text": "",
+                             "type": 3, "localId": 42, "ts": 1700000001}}
+
+        img = _parse_recordinfo(self.XML, resolve)["items"][0]
+        self.assertTrue(img.get("resolved"))
+        self.assertEqual(img["md5"], "a" * 32)
+        self.assertEqual(calls, [[900001]])  # 一次批量查询，不逐条开库
+
+    def test_kind_record_for_filter(self):
+        """合并转发单列 record 类，不再混进链接/文件（issue #31）。"""
+        from siwx.api_chat import message_kind
+        self.assertEqual(message_kind(49, None, None, None, {"items": []}), "record")
+        self.assertEqual(message_kind(49, None, {"url": "https://x"}, None, None), "link")
+
+
+class TestRecordResolver(unittest.TestCase):
+    """make_record_resolver：按 fromnewmsgid 回查原始消息（issue #31）。"""
+
+    def _make_acc(self, td, chat, other_chat=None):
+        """临时账号目录：session.db 提供 md5(chat) 反查，message_0.db 放消息。"""
+        import hashlib
+        import sqlite3
+        from pathlib import Path
+        acc = Path(td) / "acc"
+        (acc / "message").mkdir(parents=True)
+        (acc / "session").mkdir(parents=True)
+        sdb = acc / "session" / "session.db"
+        con = sqlite3.connect(sdb)
+        con.execute("CREATE TABLE SessionTable (username TEXT)")
+        for u in filter(None, (chat, other_chat)):
+            con.execute("INSERT INTO SessionTable VALUES (?)", (u,))
+        con.commit()
+        con.close()
+
+        db = acc / "message" / "message_0.db"
+        con = sqlite3.connect(db)
+        for u in filter(None, (chat, other_chat)):
+            table = "Msg_" + hashlib.md5(u.encode()).hexdigest()
+            con.execute(
+                f'CREATE TABLE "{table}" (local_id INTEGER, server_id INTEGER, '
+                f'local_type INTEGER, create_time INTEGER, origin_source INTEGER, '
+                f'real_sender_id INTEGER, message_content TEXT, packed_info_data BLOB)')
+        con.commit()
+        con.close()
+        return acc
+
+    @staticmethod
+    def _insert(acc, chat, sid, lid, ts, md5):
+        import hashlib
+        import sqlite3
+        table = "Msg_" + hashlib.md5(chat.encode()).hexdigest()
+        con = sqlite3.connect(acc / "message" / "message_0.db")
+        con.execute(f'INSERT INTO "{table}" VALUES (?, ?, 3, ?, 0, 0, ?, NULL)',
+                    (lid, sid, ts, f'<msg><img md5="{md5}" /></msg>'))
+        con.commit()
+        con.close()
+
+    def test_resolves_original_message_md5(self):
+        import tempfile
+        from siwx import api_chat
+
+        chat = "wxid_peer"
+        md5 = "b" * 32
+        with tempfile.TemporaryDirectory() as td:
+            acc = self._make_acc(td, chat)
+            self._insert(acc, chat, 900001, 7, 1700000001, md5)
+            resolve = api_chat.make_record_resolver(acc, chat)
+            got = resolve([900001, 123456])
+            self.assertIn(900001, got)
+            self.assertEqual(got[900001]["md5"], md5)
+            self.assertEqual(got[900001]["localId"], 7)
+            self.assertEqual(got[900001]["chat"], chat)
+            self.assertNotIn(123456, got)  # 原始消息不存在时不编造
+            # 二次调用命中缓存（不再查库）
+            self.assertIn(900001, resolve([900001]))
+
+    def test_resolves_cross_chat_original(self):
+        """原始消息在别的会话（真实库 1000/1392）：必须跨会话解析并带上 srcChat。"""
+        import tempfile
+        from siwx import api_chat
+
+        chat, other = "wxid_peer", "wxid_other"
+        md5 = "c" * 32
+        with tempfile.TemporaryDirectory() as td:
+            acc = self._make_acc(td, chat, other)
+            self._insert(acc, other, 910001, 9, 1700000002, md5)
+            got = api_chat.make_record_resolver(acc, chat)([910001])
+            self.assertIn(910001, got)
+            self.assertEqual(got[910001]["md5"], md5)
+            self.assertEqual(got[910001]["chat"], other)
+
+
+class TestRecordMediaExport(unittest.TestCase):
+    """导出器把合并转发子项的图片纳入媒体收集与回填（issue #31）。"""
+
+    def test_iter_record_media_walks_nested(self):
+        from siwx.exporter import _iter_record_media
+        rec = {"items": [
+            {"kind": "image", "md5": "a" * 32, "srcLocalId": 1, "srcCreateTime": 10},
+            {"kind": "text", "text": "hi"},
+            {"kind": "record", "record": {"items": [
+                {"kind": "image", "md5": "b" * 32, "srcLocalId": 2, "srcCreateTime": 20},
+            ]}},
+        ]}
+        got = [it["md5"] for it in _iter_record_media(rec)]
+        self.assertEqual(got, ["a" * 32, "b" * 32])
+
+    def test_attach_media_fills_record_item(self):
+        from siwx import exporter
+        md5 = "c" * 32
+        rec = {"title": "t", "count": 1, "items": [
+            {"sender": "a", "kind": "image", "md5": md5,
+             "srcLocalId": 42, "srcCreateTime": 1700000001}]}
+        msg = {"localType": 49, "localId": 100, "createTime": 1700000002,
+               "record": rec}
+        media_map = {exporter._media_key(md5, None, 42, 1700000001):
+                     "media/0000_cccccccccccc.jpg"}
+        exporter._attach_media(msg, media_map)
+        self.assertEqual(rec["items"][0]["mediaFile"],
+                         "media/0000_cccccccccccc.jpg")
+
+    def test_attach_media_ignores_voice_slot_for_record(self):
+        """子项只回填图片槽位，语音槽位（\\x00voice 前缀）不会串到记录里。"""
+        from siwx import exporter
+        md5 = "d" * 32
+        rec = {"items": [{"kind": "image", "md5": md5,
+                          "srcLocalId": 5, "srcCreateTime": 30}]}
+        msg = {"localType": 49, "record": rec}
+        media_map = {exporter._media_key(md5, None, 5, 30):
+                     "media/voice_0001.wav"}
+        exporter._attach_media(msg, media_map)
+        self.assertNotIn("mediaFile", rec["items"][0])
+
+
+# ── 22c. 视频预览与导出（4.x 明文 MP4 直存）─────────────────────
+
+class TestVideoMedia(TempRootCase):
+    """4.x 视频链路：packed_info field8 md5 → msg/video/<月>/<md5>.mp4。
+
+    实测依据：4.1.x 视频落盘即标准 MP4（无加密），文件名 md5 来自消息
+    packed_info_data 的 protobuf field 8（"\x42\x20"+32hex），与内容 md5 无关。
+    """
+
+    MD5 = "ab" * 16
+    VIDEO_XML = ('<msg><videomsg aeskey="k" cdnvideourl="305f" length="4085923" '
+                 'playlength="152" fromusername="wxid_demo_a" compress="2" '
+                 'cameratype="2" source="0"/></msg>')
+    PACKED = b"\x08\x1d\x10\x02\x22\x22\x42\x20" + ("ab" * 16).encode() + b"\x58\x00"
+
+    def setUp(self):
+        super().setUp()
+        from siwx import media
+        media._VIDEO_IDX_MEMO.clear()   # TTL memo 必须逐用例清空
+
+    def _fake_wechat(self, account):
+        """假微信数据根：<tmp>/wxroot/<account>/{db_storage, msg/video/2025-01}。"""
+        root = self.tmp / "wxroot" / account
+        db_dir = root / "db_storage"
+        db_dir.mkdir(parents=True, exist_ok=True)
+        vdir = root / "msg" / "video" / "2025-01"
+        vdir.mkdir(parents=True, exist_ok=True)
+        return db_dir, vdir
+
+    def test_enrich_extracts_video_md5_and_meta(self):
+        from siwx.api_chat import enrich_message_row
+        md5, bubble, voice_meta, sticker, video_meta = enrich_message_row(
+            43, self.VIDEO_XML, self.PACKED)
+        self.assertEqual(md5, self.MD5)
+        self.assertIsNone(bubble)
+        self.assertIsNone(voice_meta)
+        self.assertEqual(video_meta, {"duration": 152, "size": 4085923})
+        # 空壳（无 packed / 无属性）不炸
+        md5b, _, _, _, vm2 = enrich_message_row(43, "<msg><videomsg/></msg>", None)
+        self.assertIsNone(md5b)
+        self.assertIsNone(vm2)
+        # field8 形态缺席时退回首枚 32hex
+        md5c, _, _, _, _ = enrich_message_row(43, self.VIDEO_XML,
+                                              b"\x08\x01" + ("cd" * 16).encode())
+        self.assertEqual(md5c, "cd" * 16)
+        # packed field8 优先于 XML 属性（实机：磁盘文件名跟 packed，XML
+        # 属性是另一个 md5；155 个 mp4 实测 XML 0 命中 / packed 命中 9）
+        xml_md5 = "ef" * 16
+        md5d, _, _, _, _ = enrich_message_row(
+            43, self.VIDEO_XML.replace('cdnvideourl="305f"',
+                                       f'cdnvideourl="305f" md5="{xml_md5}"'),
+            self.PACKED)
+        self.assertEqual(md5d, self.MD5)   # packed field8 的 ab*16
+        # packed 全缺时仍可用 XML 属性兜底（v5.3.0 老数据的形态）
+        md5e, _, _, _, _ = enrich_message_row(
+            43, self.VIDEO_XML.replace('cdnvideourl="305f"',
+                                       f'cdnvideourl="305f" md5="{xml_md5}"'),
+            None)
+        self.assertEqual(md5e, xml_md5)
+
+    def test_locate_video_finds_file_and_thumb(self):
+        from siwx import media
+        acc, account, chat = make_account(self.tmp, n_texts=1)
+        db_dir, vdir = self._fake_wechat(account)
+        (vdir / f"{self.MD5}.mp4").write_bytes(b"\x00\x00\x00\x18ftypmp42" + b"v" * 64)
+        (vdir / f"{self.MD5}_thumb.jpg").write_bytes(b"\xff\xd8\xff" + b"t" * 32)
+        with mock.patch("siwx.discover.find_wechat_data_dirs",
+                        return_value=[(account, db_dir)]):
+            vp, tp = media.locate_video(account, self.MD5)
+            self.assertTrue(vp and vp.is_file() and vp.name.endswith(".mp4"))
+            self.assertTrue(tp and tp.name.endswith("_thumb.jpg"))
+            self.assertEqual(media.locate_video(account, "ff" * 16), (None, None))
+            self.assertEqual(media.locate_video(account, ""), (None, None))
+
+    def test_video_endpoint_serves_range_and_thumb(self):
+        acc, account, chat = make_account(self.tmp, n_texts=1)
+        db_dir, vdir = self._fake_wechat(account)
+        body = b"\x00\x00\x00\x18ftypmp42" + bytes(range(256))
+        (vdir / f"{self.MD5}.mp4").write_bytes(body)
+        (vdir / f"{self.MD5}_thumb.jpg").write_bytes(b"\xff\xd8\xffthumb")
+        from siwx.server import app
+        c = app.test_client()
+        with mock.patch("siwx.discover.find_wechat_data_dirs",
+                        return_value=[(account, db_dir)]):
+            r = c.get(f"/api/chat/media/video?account={account}&md5={self.MD5}")
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(r.data, body)
+            self.assertEqual(r.headers.get("Content-Type"), "video/mp4")
+            # Range：<video> 拖进度条必需（conditional=True 走 206）
+            r2 = c.get(f"/api/chat/media/video?account={account}&md5={self.MD5}",
+                       headers={"Range": "bytes=0-99"})
+            self.assertEqual(r2.status_code, 206)
+            self.assertEqual(len(r2.data), 100)
+            r3 = c.get(f"/api/chat/media/video?account={account}&md5={self.MD5}&thumb=1")
+            self.assertEqual(r3.status_code, 200)
+            self.assertEqual(r3.data, b"\xff\xd8\xffthumb")
+            # 参数守卫 + 文件不在本机
+            self.assertEqual(
+                c.get(f"/api/chat/media/video?account={account}&md5=xyz").status_code,
+                400)
+            r4 = c.get(f"/api/chat/media/video?account={account}&md5={'ff' * 16}")
+            self.assertEqual(r4.status_code, 404)
+            self.assertEqual(r4.get_json().get("reason"), "not_on_disk")
+
+    def test_export_copies_video_and_fills_media_file(self):
+        acc, account, chat = make_account(self.tmp, n_texts=2)
+        db = acc / "message" / "message_0.db"
+        t = _msg_table(chat)
+        conn = sqlite3.connect(db)
+        conn.execute(f"INSERT INTO [{t}] VALUES (?,?,?,?,?,?,?,?)",
+                     (99, 5555, 43, 1_700_000_100, 0, 1,
+                      self.VIDEO_XML.encode("utf-8"), self.PACKED))
+        conn.commit()
+        conn.close()
+        db_dir, vdir = self._fake_wechat(account)
+        (vdir / f"{self.MD5}.mp4").write_bytes(b"\x00\x00\x00\x18ftypmp42vid")
+        (vdir / f"{self.MD5}_thumb.jpg").write_bytes(b"\xff\xd8\xffth")
+        # 合并后的定位链路走 media_backup._account_root（经 _account_msg_root）
+        wx_root = self.tmp / "wxroot" / account
+        with mock.patch.object(exporter, "_account_msg_root",
+                               lambda acc: wx_root):
+            res = exporter.run_export(
+                acc, account, chat, "联系人B", "html",
+                want_messages=True, want_media=True, want_avatars=False,
+                export_root=self.tmp / "exports", pack="none",
+                progress=lambda p, m: None)
+        out = Path(res["export_dir"]) / "media"
+        vids = sorted(out.glob("video_*.mp4"))
+        thumbs = sorted(out.glob("video_*_thumb.jpg"))
+        self.assertEqual(len(vids), 1)
+        self.assertEqual(vids[0].read_bytes(), b"\x00\x00\x00\x18ftypmp42vid")
+        self.assertEqual(len(thumbs), 1)
+        self.assertEqual(res["video_count"], 1)
+        manifest = json.loads(
+            (Path(res["export_dir"]) / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["media"]["videos_ok"], 1)
+        self.assertEqual(manifest["media"]["videos_skipped"], 0)
+        html = Path(res["file"]).read_text(encoding="utf-8")
+        self.assertIn(f"media/{vids[0].name}", html)
+        self.assertIn(f"media/{thumbs[0].name}", html)
+
+    def test_attach_video_slot_isolation(self):
+        """视频槽位与图片互斥：图片消息吃不到 video_ 前缀的媒体映射。"""
+        from siwx import exporter
+        img = {"localType": 3, "localId": 9, "createTime": 100,
+               "md5": self.MD5, "bubbleMd5": None}
+        exporter._attach_media(img, {exporter._video_key(self.MD5, 9, 100):
+                                     "media/video_x.mp4"})
+        self.assertNotIn("mediaFile", img)
+        vid = {"localType": 43, "localId": 9, "createTime": 100,
+               "md5": self.MD5}
+        exporter._attach_media(vid, {exporter._video_key(self.MD5, 9, 100):
+                                     "media/video_x.mp4",
+                                     exporter._vpost_key(9, 100):
+                                     "media/video_x_thumb.jpg"})
+        self.assertEqual(vid["mediaFile"], "media/video_x.mp4")
+        self.assertEqual(vid["videoPoster"], "media/video_x_thumb.jpg")
+
+
+# ── 23. S6/S1：密钥不落盘 + 更新链 fail-closed ─────────────────
+
+class TestManifestKeyStrip(unittest.TestCase):
+    """S6：缓存清单不再持久化 SQLCipher 明文密钥，旧文件加载即剥离。"""
+
+    def test_sanitize_manifest_strips_key(self):
+        from siwx.pool import sanitize_manifest, manifest_has_keys
+        m = {"message_0.db": {"size": 1, "mtime": 2, "pages": 3, "key": "ab" * 32},
+             "@source": "d:/x"}
+        clean = sanitize_manifest(m)
+        self.assertNotIn("key", clean["message_0.db"])
+        self.assertEqual(clean["@source"], m["@source"])
+        self.assertFalse(manifest_has_keys(clean))
+        self.assertTrue(manifest_has_keys(m))
+
+    def test_save_load_roundtrip_no_key(self):
+        import tempfile
+        from pathlib import Path
+        from siwx.pool import load_manifest, save_manifest, manifest_has_keys
+        with tempfile.TemporaryDirectory() as td:
+            save_manifest(Path(td), {"a.db": {"size": 1, "key": "cd" * 32}})
+            m = load_manifest(Path(td))
+            self.assertFalse(manifest_has_keys(m))
+
+
+class TestUpdateChainHardening(unittest.TestCase):
+    """S1：更新校验 fail-closed、下载/哈希域名白名单。"""
+
+    def test_verify_sha256_empty_expected_fails_closed(self):
+        from siwx.auto_update import _verify_sha256
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as td:
+            f = Path(td) / "x.bin"
+            f.write_bytes(b"hello")
+            self.assertFalse(_verify_sha256(f, ""))          # 空期望 → 拒绝
+            self.assertFalse(_verify_sha256(f, "0" * 64))    # 哈希不匹配 → 拒绝
+
+    def test_asset_url_host_whitelist(self):
+        from siwx.auto_update import _asset_urls
+        remote = {"version": "9.9.9",
+                  "assets": {"windows": "https://evil.example.com/x.exe"}}
+        urls = _asset_urls(remote, "windows")
+        self.assertEqual(len(urls), 1)  # 非白名单域名被剔除，只剩 GitHub 兜底
+        self.assertIn("github.com", urls[0])
+
+    def test_sha_url_host_whitelist(self):
+        from siwx.auto_update import _get_asset_sha
+        self.assertEqual(_get_asset_sha(
+            {"version": "9.9.9", "sha256": "https://evil.example.com/SUMS"},
+            "windows"), "")
+
+    def test_proxy_domain_rejected_for_sha_and_assets(self):
+        """P1-4：第三方反代 raw.gh.1s.fan 只用于版本号发现，出现在哈希或
+        产物位置一律拒绝——代理投毒无法伪造可执行的更新内容。"""
+        from siwx import auto_update
+        proxy_sum = "https://raw.gh.1s.fan/ImUpXuu/SIWX/main/SHA256SUMS.txt"
+        proxy_asset = "https://raw.gh.1s.fan/ImUpXuu/SIWX/main/x.exe"
+        # 版本号发现仍保留反代（加速/可达性），仅限 version.json 位置
+        self.assertIn("raw.gh.1s.fan", " ".join(auto_update.VERSION_URLS))
+        self.assertNotIn("raw.gh.1s.fan", auto_update._ALLOWED_UPDATE_HOSTS)
+        self.assertFalse(auto_update._manifest_url_allowed(proxy_sum))
+        self.assertFalse(auto_update._manifest_url_allowed(proxy_asset))
+        self.assertEqual(auto_update._get_asset_sha(
+            {"version": "9.9.9", "sha256": proxy_sum}, "windows"), "")
+        urls = auto_update._asset_urls(
+            {"version": "9.9.9", "assets": {"windows": proxy_asset}}, "windows")
+        self.assertEqual(len(urls), 1)  # 代理产物被剔除，只剩权威源兜底
+        self.assertIn("github.com", urls[0])
+        # 投毒 manifest 整体不通过下载/哈希地址检查（版本来源会被忽略）
+        self.assertFalse(auto_update._manifest_download_urls_ok(
+            {"version": "9.9.9", "sha256": proxy_sum}))
+
+    def test_manifest_url_requires_https(self):
+        """P2-4：明文 http 的 manifest URL 一律拒绝，防中间人整体替换。"""
+        from siwx import auto_update
+        for bad in (
+            "http://github.com/ImUpXuu/SIWX/releases/download/v5.0.6/x.exe",
+            "http://raw.githubusercontent.com/ImUpXuu/SIWX/main/SHA256SUMS.txt",
+            "http://evil.com/x.exe",
+        ):
+            self.assertFalse(auto_update._manifest_url_allowed(bad), bad)
+
+    def test_objects_githubusercontent_not_whitelisted(self):
+        """P2-5：objects 域托管任意公开仓库 release 资产的签名 URL，攻击者
+        用自己恶意仓库即可获得合法 URL，不得进白名单。github.com release
+        直链 302 到该域由 urllib 自动跟随，无需显式放行。"""
+        from siwx import auto_update
+        self.assertNotIn("objects.githubusercontent.com",
+                         auto_update._ALLOWED_UPDATE_HOSTS)
+        self.assertFalse(auto_update._manifest_url_allowed(
+            "https://objects.githubusercontent.com/s3-signed/x.exe"))
+        self.assertEqual(auto_update._get_asset_sha(
+            {"version": "9.9.9",
+             "sha256": "https://objects.githubusercontent.com/s3-signed/SUMS"},
+            "windows"), "")
+
+
+# ── 24. S2：Host 头校验（DNS rebinding 防护）───────────────────
+
+class TestHostGuard(unittest.TestCase):
+    def test_localhost_allowed(self):
+        from siwx.server import app
+        c = app.test_client()
+        r = c.get("/api/update/current", headers={"Host": "127.0.0.1:8787"})
+        self.assertEqual(r.status_code, 200)
+
+    def test_evil_host_rejected(self):
+        from siwx.server import app
+        c = app.test_client()
+        r = c.get("/api/update/current", headers={"Host": "evil.example.com"})
+        self.assertEqual(r.status_code, 403)
+
+
+# ── 25. P0：detailed 留存语义（始终落盘，开关只控展示）────────────
+
+class TestDetailedRetention(unittest.TestCase):
+    """P0 回归：detailed 不再随 ROUGH 开关整体丢弃。
+
+    - ROUGH 模式：detailed 进 _FILE_LOG（导出可见）但进不了 siwx.log 文件
+      ——文件通道由 loglevel.apply 恒置 DEBUG 保证，此处不重复断言；
+    - ring=False：逐条高频埋点只绕环形缓冲，不绕文件缓冲。"""
+
+    def test_rough_mode_detailed_still_in_file_log(self):
+        from siwx import logger as _logger
+        _logger.set_level(_logger.LogLevel.ROUGH)
+        before = len(_logger._FILE_LOG)
+        _logger.detailed("test", "P0 留存断言标记 abc123")
+        self.assertEqual(len(_logger._FILE_LOG), before + 1,
+                         "ROUGH 模式 detailed 也必须进 _FILE_LOG（留存语义）")
+
+    def test_ring_false_skips_ring_but_keeps_file_log(self):
+        from siwx import logger as _logger
+        _logger.set_level(_logger.LogLevel.DETAILED)
+        ring_before = len(_logger._LOG_RING)
+        file_before = len(_logger._FILE_LOG)
+        _logger.detailed("test", "ring=False 断言标记", ring=False)
+        self.assertEqual(len(_logger._LOG_RING), ring_before,
+                         "ring=False 不得进环形缓冲")
+        self.assertEqual(len(_logger._FILE_LOG), file_before + 1,
+                         "ring=False 必须仍进文件缓冲")
+
+
+# ── 26. P1：导出链路修复（server_id 透传 / HTML 真流式）──────────
+
+class TestExportServerIdPassthrough(TempRootCase):
+    """P1-1 回归：_shard_iter 此前解包出 server_id 却丢弃，
+    message_stream 重组 row 时写死 None——导出 platformMessageId 恒空串、
+    语音导出 svr_id 恒 0（voice.get_voice 少一条命中路径）。"""
+
+    def test_platform_message_id_not_empty(self):
+        acc, account, chat = make_account(self.tmp, n_texts=5)
+        from siwx.export_stream import message_stream
+        msgs = list(message_stream(acc, chat, account=account))
+        self.assertEqual(len(msgs), 5)
+        for m in msgs:
+            self.assertTrue(m["platformMessageId"],
+                            "platformMessageId 不应再恒为空串")
+
+
+class TestHtmlStreamingExport(TempRootCase):
+    """P1-2 回归：HTML 导出改真流式后，产出与全量 build_chat_data 路线
+    数据等价（CHAT_DATA JSON 可解析、消息数一致、正文完整）。"""
+
+    def test_streamed_html_data_matches(self):
+        import json as _json
+        import re as _re
+        acc, account, chat = make_account(self.tmp, n_texts=8)
+        from siwx.exporter import run_export
+        res = run_export(acc, account, chat, "测试会话", "html",
+                         want_media=False, want_avatars=False,
+                         export_root=self.tmp / "exports", pack="folder")
+        html = Path(res["file"]).read_text(encoding="utf-8")
+        # 真流式产出的 CHAT_DATA 仍是合法 JSON（meta/members/messages 完整）
+        blob = html.split("window.CHAT_DATA = ", 1)[1].split(";</script>", 1)[0]
+        data = _json.loads(blob)
+        self.assertEqual(data["meta"]["messageCount"], 8)
+        self.assertEqual(len(data["messages"]), 8)
+        self.assertEqual(data["messages"][0]["content"], "第 0 条消息")
+        # JS 渲染器依赖的头部/尾部结构未被流式改写破坏
+        self.assertIn("const MSG_COUNT = 8;", html)
+        self.assertIn("</html>", html)
+
+
+# ── 27. 微信小黄脸内嵌 + 名片/位置/通话渲染 ─────────────────────
+
+class TestWxFaces(unittest.TestCase):
+    """wx_faces：官方表情名称表与素材一致性；文本扫描；按需 dataURI。"""
+
+    def test_assets_complete(self):
+        import base64 as _b64
+        from siwx import wx_faces
+        faces = wx_faces.load_faces()
+        self.assertEqual(len(faces), len(wx_faces.NAMES))
+        for name, b64 in faces.items():
+            raw = _b64.b64decode(b64)
+            self.assertTrue(raw.startswith(b"\x89PNG"), name)
+        # 抽查核心名称在表里
+        for n in ("[微笑]", "[破涕为笑]", "[旺柴]", "[吃瓜]", "[裂开]", "[666]"):
+            self.assertIn(n, faces)
+
+    def test_find_used(self):
+        from siwx import wx_faces
+        self.assertEqual(wx_faces.find_used("你好[微笑][破涕为笑]"),
+                         {"[微笑]", "[破涕为笑]"})
+        # 未知 [xxx] 不是表情
+        self.assertEqual(wx_faces.find_used("[不存在的表情]"), set())
+        # 引用块里的表情也被收集
+        used = wx_faces.used_from_message(
+            {"content": "[旺柴]", "quote": {"content": "[吃瓜]"}})
+        self.assertEqual(used, {"[旺柴]", "[吃瓜]"})
+
+    def test_datauris_filters_unknown(self):
+        from siwx import wx_faces
+        out = wx_faces.datauris(["[微笑]", "[不存在的]"])
+        self.assertEqual(set(out), {"[微笑]"})
+        self.assertTrue(out["[微笑]"].startswith("data:image/png;base64,"))
+
+
+class TestHtmlFaceInjection(unittest.TestCase):
+    """HTML 导出：[表情名] → 官方表情图（按需 base64 注入 window.WX_FACES）。"""
+
+    def test_used_faces_embedded_only(self):
+        from siwx.html_template import render_html
+        data = self._chat_data("早[微笑]晚[破涕为笑]")
+        html = render_html(data)
+        self.assertIn("window.WX_FACES", html)
+        # 只嵌入用到的 2 张
+        self.assertEqual(html.count("data:image/png;base64,"), 2)
+        # 渲染器把 [表情名] 替换为 wx-face 图片（静态契约）
+        self.assertIn('class="wx-face"', html)
+        self.assertNotIn('alt="[微笑]"', html)  # alt 由 JS 运行时生成
+
+    def test_no_faces_no_injection(self):
+        from siwx.html_template import render_html
+        data = self._chat_data("普通文本消息")
+        html = render_html(data)
+        # 渲染器注释里含 WX_FACES 字样，这里断言的是注入语句本身
+        self.assertNotIn("window.WX_FACES =", html)
+
+    def test_stream_tail_injects_faces(self):
+        import io
+        from siwx.html_template import stream_html_tail
+        from siwx import wx_faces
+        buf = io.StringIO()
+        stream_html_tail(buf, 3, "会话",
+                         faces=wx_faces.datauris({"[微笑]"}))
+        out = buf.getvalue()
+        self.assertIn("window.WX_FACES =", out)
+        self.assertIn("data:image/png;base64,", out)
+        # faces 为空时不注入空对象
+        buf2 = io.StringIO()
+        stream_html_tail(buf2, 0, "会话")
+        self.assertNotIn("window.WX_FACES =", buf2.getvalue())
+
+    def test_renderer_branches_present(self):
+        """渲染器静态契约：名片(42)/位置(48)/通话(50) 分支与地图跳转。"""
+        from siwx.html_template import get_template
+        R = get_template().renderer
+        self.assertIn("t === 42", R)
+        self.assertIn("xmlVal(raw, 'nickname')", R)
+        self.assertIn("t === 48", R)
+        self.assertIn("xmlAttr(raw, 'location', 'x')", R)
+        # 跳转用 URI API marker（旧 poi 接口已废弃 HTTP 501）；无坐标回退 search
+        self.assertIn("apis.map.qq.com/uri/v1/marker", R)
+        self.assertIn("apis.map.qq.com/uri/v1/search", R)
+        self.assertIn("t === 50", R)
+        self.assertIn("xmlVal(raw, 'calltype')", R)
+        self.assertIn("xmlVal(raw, 'duration')", R)
+        # 表情替换应用于正文/引用/系统消息
+        self.assertIn("fmtText(sc)", R)
+        self.assertIn("fmtText(msg.quote.content)", R)
+        self.assertIn("return fmtText(content);", R)
+        # 本轮新增：合并转发/转文字/CDN 回退/撤回文案/文件大小/红包收窄
+        self.assertIn("msg.record) return renderRecord", R)
+        self.assertIn("voiceTrans(raw)", R)
+        self.assertIn("xmlAttr(raw, 'emoji', 'cdnurl')", R)
+        self.assertIn("xmlVal(sc, 'replacemsg')", R)
+        self.assertIn("xmlVal(raw, 'totallen')", R)
+        self.assertIn("raw.indexOf('<wcpayinfo')", R)
+        # 类型名映射补全（此前 50/42/48 裸露为 "类型50"）
+        self.assertIn("42:'名片'", R)
+        self.assertIn("48:'位置'", R)
+        self.assertIn("50:'通话'", R)
+        self.assertIn("10002:'撤回'", R)
+        # 文件卡图标（无 url 的文件消息不再挂 🔗）；记录卡子消息时间；esc 转义引号
+        self.assertIn("finfo ? '📄' : '🔗'", R)
+        self.assertIn("recordItemTime", R)
+        self.assertIn(".replace(/'/g, '&#39;')", R)
+
+    @staticmethod
+    def _chat_data(content):
+        from siwx.html_template import build_chat_data
+        msgs = [{
+            "createTime": 1, "senderUsername": "a", "senderDisplayName": "A",
+            "localType": 1, "content": content, "rawContent": "", "isSend": 0,
+        }]
+        session = {"wxid": "room", "displayName": "会话", "isGroup": False,
+                   "firstTimestamp": 1, "lastTimestamp": 1, "ownerId": "o",
+                   "messageCount": 1}
+        return build_chat_data(session, msgs, {})
+
+
+class TestHtmlFacesEndToEnd(TempRootCase):
+    """全链路：分片里带 [表情名] 的真实导出，WX_FACES 只含用到的表情。"""
+
+    def test_export_embeds_used_faces(self):
+        acc = self.tmp / "output" / fx.DEMO_SELF
+        msg_dir = acc / "message"
+        make_shard(msg_dir / "message_0.db", "wxid_demo_b",
+                   ["带表情[微笑]", "再一个[旺柴]"])
+        make_empty_shard(msg_dir / "media_0.db")
+        make_empty_shard(msg_dir / "message_fts.db")
+        self._make_contact_session(acc)
+        from siwx.exporter import run_export
+        res = run_export(acc, fx.DEMO_SELF, "wxid_demo_b", "测试会话", "html",
+                         want_media=False, want_avatars=False,
+                         export_root=self.tmp / "exports", pack="folder")
+        html = Path(res["file"]).read_text(encoding="utf-8")
+        self.assertIn("window.WX_FACES =", html)
+        self.assertEqual(html.count("data:image/png;base64,"), 2)
+        self.assertIn('"[微笑]"', html)
+        self.assertIn('"[旺柴]"', html)
+        # WX_FACES 对象本身合法 JSON
+        blob = html.split("window.WX_FACES = ", 1)[1].split(";</script>", 1)[0]
+        data = json.loads(blob)
+        self.assertEqual(set(data), {"[微笑]", "[旺柴]"})
+
+    @staticmethod
+    def _make_contact_session(acc):
+        (acc / "contact").mkdir(parents=True, exist_ok=True)
+        c = sqlite3.connect(acc / "contact" / "contact.db")
+        c.execute("CREATE TABLE contact (username TEXT, remark TEXT, "
+                  "nick_name TEXT, alias TEXT)")
+        c.execute("INSERT INTO contact VALUES (?,?,?,?)",
+                  ("wxid_demo_b", "联系人B", "", ""))
+        c.commit()
+        c.close()
+        (acc / "session").mkdir(parents=True, exist_ok=True)
+        s = sqlite3.connect(acc / "session" / "session.db")
+        s.execute("CREATE TABLE SessionTable (username TEXT, summary TEXT, "
+                  "sort_timestamp INTEGER)")
+        s.execute("INSERT INTO SessionTable VALUES (?,?,?)",
+                  ("wxid_demo_b", "预览", 1_700_000_010))
+        s.commit()
+        s.close()
+
+
+# ── 28. 位置静态缩略图（wx_maps） ─────────────────────────────
+
+LOCATION_RAW = ('<location poiname="腾讯滨海大厦" label="深圳市南山区科技园" '
+                'x="22.540503" y="113.934428" scale="16"/>')
+
+
+class TestWxMaps(unittest.TestCase):
+    """wx_maps：瓦片键计算、位置消息解析、尽力下载与缓存/离线降级。"""
+
+    def setUp(self):
+        from siwx import wx_maps
+        wx_maps.reset()
+
+    def test_tile_key_known_values(self):
+        from siwx import wx_maps
+        self.assertEqual(wx_maps.tile_key(22.540503, 113.934428),
+                         "15/26754/14277")
+        self.assertEqual(wx_maps.tile_key(39.9042, 116.4074), "15/26979/12416")
+        # 越界坐标收敛到合法瓦片范围
+        k = wx_maps.tile_key(-85.2, 200.0)
+        z, x, y = k.split("/")
+        self.assertTrue(0 <= int(x) <= 32767 and 0 <= int(y) <= 32767)
+
+    def test_used_from_message(self):
+        from siwx import wx_maps
+        self.assertEqual(wx_maps.used_from_message(
+            {"localType": 48, "rawContent": LOCATION_RAW}),
+            {"15/26754/14277"})
+        # entry 形态（localType 缺省时回退 type 字段）
+        self.assertEqual(wx_maps.used_from_message(
+            {"type": 48, "rawContent": LOCATION_RAW}), {"15/26754/14277"})
+        # 非 48 / 无坐标 / 坐标非法 → 空集
+        self.assertEqual(wx_maps.used_from_message(
+            {"localType": 1, "rawContent": LOCATION_RAW}), set())
+        self.assertEqual(wx_maps.used_from_message(
+            {"localType": 48, "rawContent": "<msg/>"}), set())
+        self.assertEqual(wx_maps.used_from_message(
+            {"localType": 48, "rawContent":
+             '<location x="999" y="999"/>'}), set())
+
+    def test_datauris_cache_and_offline(self):
+        import base64 as _b64
+        from siwx import wx_maps
+        calls = []
+        orig = wx_maps._fetch_tile
+        wx_maps._fetch_tile = lambda key: (calls.append(key) or b"\x89PNGfake")
+        try:
+            out = wx_maps.datauris({"15/26754/14277", "15/26979/12416"})
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(out["15/26754/14277"],
+                             "data:image/png;base64," +
+                             _b64.b64encode(b"\x89PNGfake").decode())
+            # 命中缓存后重复调用不再下载
+            wx_maps.datauris({"15/26754/14277"})
+            self.assertEqual(len(calls), 2)
+        finally:
+            wx_maps._fetch_tile = orig
+
+    def test_datauris_failure_sticky_offline(self):
+        from siwx import wx_maps
+        calls = []
+        orig = wx_maps._fetch_tile
+        def boom(key):
+            calls.append(key)
+            raise OSError("offline")
+        wx_maps._fetch_tile = boom
+        try:
+            self.assertEqual(wx_maps.datauris({"15/26754/14277"}), {})
+            # 首次失败后本进程内不再尝试（多会话导出不逐个付超时）
+            self.assertEqual(wx_maps.datauris({"15/26979/12416"}), {})
+            self.assertEqual(len(calls), 1)
+        finally:
+            wx_maps._fetch_tile = orig
+        wx_maps.reset()
+        wx_maps._fetch_tile = lambda key: b"\x89PNGfake"
+        try:
+            out = wx_maps.datauris({"15/26754/14277"})
+            self.assertEqual(set(out), {"15/26754/14277"})
+        finally:
+            wx_maps._fetch_tile = orig
+
+
+class TestHtmlMapInjection(unittest.TestCase):
+    """HTML 注入契约：WX_MAPS 仅在有瓦片时注入；渲染器含缩略图分支。"""
+
+    def test_stream_tail_injects_maps(self):
+        import io
+        from siwx.html_template import stream_html_tail
+        buf = io.StringIO()
+        stream_html_tail(buf, 1, "会话",
+                         maps={"15/26754/14277": "data:image/png;base64,AA"})
+        self.assertIn("window.WX_MAPS =", buf.getvalue())
+        buf2 = io.StringIO()
+        stream_html_tail(buf2, 0, "会话")
+        self.assertNotIn("window.WX_MAPS =", buf2.getvalue())
+
+    def test_render_html_injects_maps_for_location(self):
+        from siwx.html_template import render_html
+        from siwx import wx_maps
+        wx_maps.reset()
+        orig = wx_maps._fetch_tile
+        wx_maps._fetch_tile = lambda key: b"\x89PNGfake"
+        try:
+            data = TestHtmlFaceInjection._chat_data("x")
+            data["messages"][0]["type"] = 48
+            data["messages"][0]["rawContent"] = LOCATION_RAW
+            html = render_html(data)
+            self.assertIn("window.WX_MAPS =", html)
+            self.assertIn('"15/26754/14277"', html)
+        finally:
+            wx_maps._fetch_tile = orig
+            wx_maps.reset()
+
+    def test_renderer_map_contract(self):
+        from siwx.html_template import get_template
+        tpl = get_template()
+        self.assertIn("window.WX_MAPS", tpl.renderer)
+        self.assertIn("function tileKey", tpl.renderer)
+        self.assertIn('class="wx-map"', tpl.renderer)
+        self.assertIn("wx-card-mapleft", tpl.renderer)
+        self.assertIn(".wx-map{", tpl.head)
+
+
+class TestHtmlMapsEndToEnd(TempRootCase):
+    """全链路：真实导出 → 位置消息命中的瓦片注入 WX_MAPS；离线回退文字卡。"""
+
+    def _make_account_with_location(self):
+        acc = self.tmp / "output" / fx.DEMO_SELF
+        msg_dir = acc / "message"
+        make_shard(msg_dir / "message_0.db", "wxid_demo_b",
+                   ["到达附近了[微笑]"])
+        conn = sqlite3.connect(msg_dir / "message_0.db")
+        t = _msg_table("wxid_demo_b")
+        conn.execute(f"INSERT INTO [{t}] VALUES (?,?,?,?,?,?,?,?)",
+                     (2, 1001, 48, 1_700_000_001, 0, 1,
+                      LOCATION_RAW.encode("utf-8"), None))
+        conn.commit()
+        conn.close()
+        make_empty_shard(msg_dir / "media_0.db")
+        make_empty_shard(msg_dir / "message_fts.db")
+        TestHtmlFacesEndToEnd._make_contact_session(acc)
+        return acc
+
+    def _run_export(self, acc):
+        from siwx.exporter import run_export
+        return run_export(acc, fx.DEMO_SELF, "wxid_demo_b", "测试会话", "html",
+                          want_media=False, want_avatars=False,
+                          export_root=self.tmp / "exports", pack="folder")
+
+    def setUp(self):
+        super().setUp()
+        from siwx import wx_maps
+        wx_maps.reset()
+
+    def test_export_embeds_location_tile(self):
+        acc = self._make_account_with_location()
+        from siwx import wx_maps
+        orig = wx_maps._fetch_tile
+        wx_maps._fetch_tile = lambda key: b"\x89PNGfake"
+        try:
+            res = self._run_export(acc)
+        finally:
+            wx_maps._fetch_tile = orig
+        html = Path(res["file"]).read_text(encoding="utf-8")
+        self.assertIn("window.WX_MAPS =", html)
+        self.assertIn('"15/26754/14277"', html)
+        # 渲染器分支与表情注入并存
+        self.assertIn("window.WX_FACES =", html)
+        self.assertIn('"[微笑]"', html)
+
+    def test_export_offline_keeps_text_card(self):
+        acc = self._make_account_with_location()
+        from siwx import wx_maps
+        orig = wx_maps._fetch_tile
+        wx_maps._fetch_tile = lambda key: (_ for _ in ()).throw(OSError("x"))
+        try:
+            res = self._run_export(acc)
+        finally:
+            wx_maps._fetch_tile = orig
+        html = Path(res["file"]).read_text(encoding="utf-8")
+        self.assertNotIn("window.WX_MAPS =", html)
+        # 坐标与跳转链接仍随 rawContent 在，渲染器回退文字卡 + marker 链接
+        self.assertIn("22.540503", html)
+        self.assertIn("apis.map.qq.com/uri/v1/marker", html)
+
+
+# ── 29. 本人身份判定（微信4.x 设备后缀账号名）+ 正向翻页 ────────
+
+class TestSelfIdentity(TempRootCase):
+    """is_me 判定：账号目录名带十六进制设备后缀（wxid_xxx_d901）时，
+    本人消息（发送者为不带后缀的原始 wxid）不得被错判为对方。
+    实测案例：743 条本人文本落左侧、15 条通话错落右侧。"""
+
+    def _make_hex_account(self, contacts):
+        """账号目录名 wxid_abc_d901；contacts 是放进 contact 表的 username 列表。"""
+        acc = self.tmp / "output" / "wxid_abc_d901"
+        if acc.exists():
+            shutil.rmtree(acc)
+        msg_dir = acc / "message"
+        msg_dir.mkdir(parents=True, exist_ok=True)
+        (acc / "contact").mkdir(parents=True, exist_ok=True)
+        c = sqlite3.connect(acc / "contact" / "contact.db")
+        c.execute("CREATE TABLE contact (username TEXT, remark TEXT, "
+                  "nick_name TEXT, alias TEXT)")
+        for u in contacts:
+            c.execute("INSERT INTO contact VALUES (?,?,?,?)", (u, u, u, ""))
+        c.commit(); c.close()
+        # Name2Id: 1=peer, 2=原始 wxid, 3=设备后缀变体；三条消息各指一个
+        chat = "wxid_peer"
+        t = _msg_table(chat)
+        conn = sqlite3.connect(msg_dir / "message_0.db")
+        conn.execute(f"""CREATE TABLE [{t}] (
+            local_id INTEGER PRIMARY KEY, server_id INTEGER, local_type INTEGER,
+            create_time INTEGER, origin_source INTEGER, real_sender_id INTEGER,
+            message_content BLOB, packed_info_data BLOB)""")
+        conn.execute("CREATE TABLE Name2Id (user_name TEXT)")
+        for i, u in enumerate((chat, "wxid_abc", "wxid_abc_d901"), start=1):
+            conn.execute("INSERT INTO Name2Id(rowid, user_name) VALUES (?,?)",
+                         (i, u))
+        for i, (ts, rsid) in enumerate([(1_700_000_001, 2),   # 本人（原始 wxid）
+                                        (1_700_000_002, 1),   # 对方
+                                        (1_700_000_003, 3),   # 本人（后缀变体）
+                                        (1_700_000_004, 2)]):  # 本人（原始 wxid）
+            conn.execute(f"INSERT INTO [{t}] VALUES (?,?,?,?,?,?,?,?)",
+                         (i + 1, 1000 + i, 1, ts, 0, rsid,
+                          f"消息{i}".encode("utf-8"), None))
+        conn.commit(); conn.close()
+        return acc, chat
+
+    def test_message_stream_marks_self_correctly(self):
+        acc, chat = self._make_hex_account(["wxid_abc", "wxid_peer"])
+        from siwx.export_stream import message_stream
+        msgs = list(message_stream(acc, chat, None, None,
+                                   "wxid_abc_d901", None))
+        self.assertEqual([(m["isSend"], m["senderUsername"]) for m in msgs],
+                         [(1, "wxid_abc"),      # 原始 wxid → 本人
+                          (0, "wxid_peer"),     # 对方不受影响
+                          (1, "wxid_abc"),      # 设备后缀变体 → 本人，归一到原始 wxid
+                          (1, "wxid_abc")])
+        # 归一后本人名字可解析
+        self.assertEqual(msgs[2]["senderDisplayName"], "wxid_abc")
+
+    def test_self_ids_gating(self):
+        """剥十六进制后缀必须有联系人佐证：目录名与 base 都存在 → 不剥。"""
+        from siwx.api_chat import self_ids_for
+        acc, _chat = self._make_hex_account(["wxid_abc", "wxid_peer"])
+        preferred, ids = self_ids_for(acc, "wxid_abc_d901")
+        self.assertEqual(preferred, "wxid_abc")
+        self.assertEqual(set(ids), {"wxid_abc", "wxid_abc_d901"})
+        # 完整目录名也是联系人（罕见但可能是真实 wxid）→ 不剥离
+        acc2, _ = self._make_hex_account(["wxid_abc", "wxid_abc_d901"])
+        preferred2, ids2 = self_ids_for(acc2, "wxid_abc_d901")
+        self.assertEqual(preferred2, "wxid_abc_d901")
+        self.assertEqual(set(ids2), {"wxid_abc_d901"})
+        # 联系人表里谁都不存在 → 维持旧行为（不剥离）
+        acc3, _ = self._make_hex_account([])
+        preferred3, ids3 = self_ids_for(acc3, "wxid_abc_d901")
+        self.assertEqual(preferred3, "wxid_abc_d901")
+        self.assertEqual(set(ids3), {"wxid_abc_d901"})
+
+    def test_web_chat_page_renders_record(self):
+        """网页端聊天页与导出 HTML 同口径：合并转发逐条展开，不再单行预览。"""
+        src = (ROOT / "siwx" / "ui" / "pages" / "chat.js").read_text(encoding="utf-8")
+        self.assertIn("m.record", src)
+        self.assertIn("m-record-title", src)
+        self.assertIn("m-record-item", src)
+        self.assertIn("m-record-count", src)
+
+    def test_messages_api_forward_paging_and_owner(self):
+        """/api/chat/messages：after 正向翻页、has_newer、owner 字段。"""
+        acc, account, chat = make_account(self.tmp, n_texts=6)
+        from siwx.server import app
+        client = app.test_client()
+        base = (f"/api/chat/messages?account={account}&chat={chat}")
+        r1 = client.get(f"{base}&limit=2").get_json()
+        self.assertEqual(len(r1["messages"]), 2)          # 最新的 2 条
+        self.assertFalse(r1["has_newer"])                 # 打开会话=最新窗口
+        self.assertEqual(r1["owner"], account)            # 本人 wxid（无后缀场景）
+        # 反向翻页带游标 → 窗口之后还有消息
+        before_ts = r1["messages"][0]["ts"]
+        r2 = client.get(f"{base}&limit=2&before={before_ts}").get_json()
+        self.assertTrue(r2["has_newer"])
+        # 正向从 r2 页尾继续 → 回到 r1 的内容；6 条消息 limit 2 时
+        # r3 已是最后一页，has_more=False
+        last = r2["messages"][-1]
+        r3 = client.get(f"{base}&limit=2&after={last['ts']}"
+                        f"&after_id={last['id']}").get_json()
+        self.assertEqual([m["id"] for m in r3["messages"]],
+                         [m["id"] for m in r1["messages"]])
+        self.assertFalse(r3["has_more"])
+        # 越过最后一页 → 空页且 has_more=False
+        last3 = r3["messages"][-1]
+        r4 = client.get(f"{base}&limit=2&after={last3['ts']}"
+                        f"&after_id={last3['id']}").get_json()
+        self.assertEqual(r4["messages"], [])
+        self.assertFalse(r4["has_more"])
+
+
+# ── 聊天内搜索/筛选（微信式）────────────────────────────────
+
+class TestChatMessageFilter(TempRootCase):
+    """/api/chat/messages 的 q/kind/start/end 筛选。
+
+    message_content 可能是 zstd 压缩 BLOB，SQL LIKE 对压缩行失明——
+    关键词匹配必须在 Python 层解码后做；本类用压缩+明文混合样本验证
+    完整性、精确总数、类型/日期过滤与游标分页语义。"""
+
+    def _seed(self):
+        """在 make_account 的会话里铺多类型样本 + 1 条 zstd 压缩文本。"""
+        acc, account, chat = make_account(self.tmp, n_texts=0)
+        conn = sqlite3.connect(acc / "message" / "message_0.db")
+        t = _msg_table(chat)
+        base = 1_700_000_000
+        rows = [
+            (1, 1, base, "普通的第 1 条"),
+            (2, 1, base + 10, "开会啦，会议纪要在群里"),
+            (3, 3, base + 20, ""),                       # 图片
+            (4, 34, base + 30, ""),                      # 语音
+            (5, 43, base + 40, ""),                      # 视频
+            (6, 47, base + 50, ""),                      # 表情
+            (7, 49, base + 60, "<msg><title>周报链接</title></msg>"),
+            (8, 10000, base + 70, "有人进了群"),
+            (9, 1, base + 80, "第二场会议纪要已同步"),
+            (11, 1, base + 100, "Project Phoenix kickoff"),
+        ]
+        for lid, ltype, ts, content in rows:
+            conn.execute(f"INSERT INTO [{t}] VALUES (?,?,?,?,?,?,?,?)",
+                         (lid, 1000 + lid, ltype, ts, 0, 1,
+                          content.encode("utf-8"), None))
+        # zstd 压缩行：SQL LIKE 不可见，只有 Python 解码路径能搜到；
+        # 时间戳放到次日（+25h），日期过滤两侧都可测
+        try:
+            import zstandard
+            comp = zstandard.ZstdCompressor().compress(
+                "这份机密文件请查收".encode("utf-8"))
+            conn.execute(f"INSERT INTO [{t}] VALUES (?,?,?,?,?,?,?,?)",
+                         (10, 1009, 1, base + 90000, 0, 1, comp, None))
+        except ImportError:
+            pass
+        conn.commit()
+        conn.close()
+        from datetime import datetime
+        self.day = datetime.fromtimestamp(base).strftime("%Y-%m-%d")
+        self.late_day = datetime.fromtimestamp(base + 90000).strftime("%Y-%m-%d")
+        return acc, account, chat
+
+    def _get(self, account, chat, query=""):
+        from siwx.server import app
+        return app.test_client().get(
+            f"/api/chat/messages?account={account}&chat={chat}{query}").get_json()
+
+    def test_keyword_search_total_and_content(self):
+        acc, account, chat = self._seed()
+        r = self._get(account, chat, "&q=%E4%BC%9A%E8%AE%AE%E7%BA%AA%E8%A6%81")
+        self.assertTrue(r["filtered"])
+        self.assertEqual(r["total"], 2)
+        self.assertEqual(len(r["messages"]), 2)
+        self.assertTrue(all("会议纪要" in m["text"] for m in r["messages"]))
+        self.assertFalse(r["has_more"])
+        self.assertFalse(r["has_newer"])
+        # 英文关键词大小写不敏感
+        r2 = self._get(account, chat, "&q=phoenix")
+        self.assertEqual(r2["total"], 1)
+        self.assertIn("Phoenix", r2["messages"][0]["text"])
+
+    def test_keyword_search_finds_zstd_row(self):
+        acc, account, chat = self._seed()
+        r = self._get(account, chat, "&q=%E6%9C%BA%E5%AF%86")
+        self.assertEqual(r["total"], 1)
+        self.assertIn("机密", r["messages"][0]["text"])
+
+    def test_kind_cursor_paging_semantics(self):
+        """筛选模式游标分页与普通分页同语义：不重不漏、total 稳定。"""
+        acc, account, chat = self._seed()
+        base = "/api/chat/messages?account=%s&chat=%s" % (account, chat)
+        from siwx.server import app
+        c = app.test_client()
+        r1 = c.get(f"{base}&kind=text&limit=2").get_json()
+        self.assertEqual(r1["total"], 5)           # 3 条明文 + 英文行 + 压缩行
+        self.assertEqual(len(r1["messages"]), 2)
+        self.assertTrue(r1["has_more"])
+        self.assertFalse(r1["has_newer"])          # 打开会话 = 最新匹配窗口
+        # 反向翻页：total 不变，翻到最旧后 has_more=False，游标不重不漏
+        seen, cur = [m["id"] for m in r1["messages"]], r1["messages"][0]
+        while True:
+            r = c.get(f"{base}&kind=text&limit=2"
+                      f"&before={cur['ts']}&before_id={cur['id']}").get_json()
+            if not r["messages"]:
+                break
+            seen.extend(m["id"] for m in r["messages"])
+            self.assertEqual(r["total"], r1["total"])
+            cur = r["messages"][0]
+            if not r["has_more"]:
+                break
+        self.assertEqual(len(seen), len(set(seen)))
+        self.assertEqual(len(seen), 5)
+        # 正向：after 游标从最旧处继续 → 有更新的匹配
+        r2 = c.get(f"{base}&kind=text&limit=2"
+                   f"&after={cur['ts']}&after_id={cur['id']}").get_json()
+        self.assertTrue(r2["messages"])
+        self.assertTrue(r2["has_newer"])
+
+    def test_kind_filter_maps_to_type_groups(self):
+        acc, account, chat = self._seed()
+        for kind, ltype in (("image", 3), ("voice", 34), ("video", 43),
+                            ("sticker", 47), ("link", 49), ("system", 10000)):
+            r = self._get(account, chat, f"&kind={kind}")
+            self.assertEqual(r["total"], 1, kind)
+            self.assertEqual(r["messages"][0]["type"], ltype, kind)
+        # 文本 = 3 条明文 + 英文行 + 压缩行
+        r = self._get(account, chat, "&kind=text")
+        self.assertEqual(r["total"], 5)
+        # 非法 kind → 400
+        from siwx.server import app
+        resp = app.test_client().get(
+            f"/api/chat/messages?account={account}&chat={chat}&kind=bogus")
+        self.assertEqual(resp.status_code, 400)
+
+    def test_date_range_filter(self):
+        acc, account, chat = self._seed()
+        r = self._get(account, chat, f"&start={self.day}&end={self.day}")
+        self.assertEqual(r["total"], 10)     # 首日样本 10 条（压缩行在次日）
+        r2 = self._get(account, chat, f"&start={self.late_day}")
+        self.assertEqual(r2["total"], 1)     # 次日只有压缩行
+        # 非法日期 → 400
+        from siwx.server import app
+        resp = app.test_client().get(
+            f"/api/chat/messages?account={account}&chat={chat}&start=abc")
+        self.assertEqual(resp.status_code, 400)
+
+    def test_too_long_keyword_rejected(self):
+        acc, account, chat = self._seed()
+        from siwx.server import app
+        resp = app.test_client().get(
+            f"/api/chat/messages?account={account}&chat={chat}&q={'x' * 201}")
+        self.assertEqual(resp.status_code, 400)
+
+    def test_unfiltered_response_keeps_legacy_shape(self):
+        acc, account, chat = self._seed()
+        r = self._get(account, chat, "&limit=3")
+        self.assertNotIn("filtered", r)
+        self.assertNotIn("total", r)
+        self.assertEqual(len(r["messages"]), 3)
+
+    def test_web_chat_page_has_search_ui(self):
+        """前端接线齐全：搜索框、类型 chips、高亮与上下文跳转。"""
+        js = (ROOT / "siwx" / "ui" / "pages" / "chat.js").read_text(encoding="utf-8")
+        html_ = (ROOT / "siwx" / "ui" / "pages" / "chat.html").read_text(encoding="utf-8")
+        for token in ("c-msg-q", "c-kind-chips", "highlightMatches", "jumpToTs",
+                      "runFilteredLoad", "exitFilter"):
+            self.assertIn(token, js)
+        self.assertIn('data-kind="image"', html_)
+        self.assertIn('id="c-filter"', html_)
+        # 缓存指纹必须刷新，否则升级后浏览器仍用旧 UI（本地指纹线，非上游值）。
+        # 不硬编码具体串：从 app.js 读取当前 UI_VERSION，再校验 index.html
+        # 的引用与之一致（指纹本身由 tests/test_version_sync.py 统一钉住）。
+        appjs = (ROOT / "siwx" / "ui" / "app.js").read_text(encoding="utf-8")
+        m = re.search(r"UI_VERSION\s*=\s*'([^']+)'", appjs)
+        self.assertIsNotNone(m, "app.js 缺少 UI_VERSION")
+        ver = m.group(1)
+        index = (ROOT / "siwx" / "ui" / "index.html").read_text(encoding="utf-8")
+        self.assertIn(f"/app.js?v={ver}", index)
+        self.assertIn(f"/common.js?v={ver}", index)
+
+
+# ── 30. HTML 模板可替换框架 + 合并转发/转文字渲染 ───────────────
+
+class TestHtmlTemplateFramework(TempRootCase):
+    """模板包解析：内置 default 可用、用户目录同名覆盖、缺失报错。"""
+
+    def test_builtin_default_loads(self):
+        from siwx.html_template import get_template, list_templates
+        tpl = get_template("default")
+        self.assertIn("<!DOCTYPE html>", tpl.head)
+        self.assertIn("renderContent", tpl.renderer)
+        names = [t["name"] for t in list_templates()]
+        self.assertIn("default", names)
+        self.assertTrue([t for t in list_templates() if t["name"] == "default"]
+                        [0]["builtin"])
+
+    def test_user_template_overrides_builtin(self):
+        # TempRootCase 把 SIWX_ROOT 指向临时目录 → 用户模板根 <tmp>/templates
+        root = self.tmp / "templates" / "mytpl"
+        root.mkdir(parents=True)
+        (root / "manifest.json").write_text(
+            json.dumps({"name": "mytpl", "label": "我的模板"}, ensure_ascii=False),
+            encoding="utf-8")
+        (root / "head.html").write_text("<!DOCTYPE html><title>mytpl</title>",
+                                        encoding="utf-8")
+        (root / "renderer.js").write_text("// custom", encoding="utf-8")
+        from siwx.html_template import get_template
+        tpl = get_template("mytpl")
+        self.assertEqual(tpl.label, "我的模板")
+        self.assertIn("mytpl", tpl.head)
+        # list 中标记为非内置
+        from siwx.html_template import list_templates
+        me = [t for t in list_templates() if t["name"] == "mytpl"][0]
+        self.assertFalse(me["builtin"])
+
+    def test_missing_template_raises(self):
+        from siwx.html_template import get_template
+        with self.assertRaises(RuntimeError):
+            get_template("no_such_template")
+
+    def test_stream_head_tail_use_template(self):
+        import io
+        from siwx.html_template import stream_html_head, stream_html_tail
+        session = {"wxid": "c", "displayName": "会话", "isGroup": False,
+                   "firstTimestamp": 0, "lastTimestamp": 0, "ownerId": "o",
+                   "messageCount": 0}
+        buf = io.StringIO()
+        stream_html_head(buf, session, [], {}, template="default")
+        stream_html_tail(buf, 0, "会话", template="default")
+        self.assertIn("<!DOCTYPE html>", buf.getvalue())
+        self.assertIn("MSG_COUNT = 0", buf.getvalue())
+
+    def test_export_with_unknown_template_fails_clean(self):
+        acc, account, chat = make_account(self.tmp, n_texts=2)
+        from siwx.exporter import run_export
+        with self.assertRaises(RuntimeError):
+            run_export(acc, account, chat, "测试会话", "html",
+                       want_media=False, want_avatars=False,
+                       export_root=self.tmp / "exports", pack="folder",
+                       template="no_such_template")
+
+    def test_templates_api_endpoint(self):
+        from siwx.server import app
+        client = app.test_client()
+        r = client.get("/api/export/templates")
+        self.assertEqual(r.status_code, 200)
+        names = [t["name"] for t in r.get_json()["templates"]]
+        self.assertIn("default", names)
+
+
+class TestHtmlRenderFixes(unittest.TestCase):
+    """不足清单修复：record 透传与嵌套渲染。"""
+
+    def test_msg_entry_passes_record(self):
+        from siwx.html_template import _msg_entry
+        rec = {"title": "甲和乙的聊天记录", "count": 2,
+               "items": [{"sender": "甲", "ts": 1, "text": "你好"}]}
+        m = {"createTime": 1, "senderUsername": "a", "senderDisplayName": "A",
+             "localType": 49, "content": "[聊天记录] 甲和乙的聊天记录",
+             "rawContent": "<recordinfo/>", "isSend": 0, "record": rec}
+        self.assertEqual(_msg_entry(m)["record"], rec)
+
+    def test_render_record_html(self):
+        from siwx.html_template import render_html
+        rec = {"title": "甲和乙的聊天记录", "count": 2,
+               "items": [{"sender": "甲", "ts": 1, "text": "你好[微笑]"},
+                         {"sender": "乙", "ts": 2, "text": "[图片]"}]}
+        msgs = [{"createTime": 1, "senderUsername": "a", "senderDisplayName": "A",
+                 "localType": 49, "content": "[聊天记录] 甲和乙的聊天记录",
+                 "rawContent": "<recordinfo/>", "isSend": 0, "record": rec}]
+        session = {"wxid": "room", "displayName": "会话", "isGroup": False,
+                   "firstTimestamp": 1, "lastTimestamp": 1, "ownerId": "o",
+                   "messageCount": 1}
+        html = render_html(self._chat_data(msgs))
+        # record 数据完整进入 CHAT_DATA（渲染由 JS 运行时完成）
+        self.assertIn('"record"', html)
+        self.assertIn("甲和乙的聊天记录", html)
+        # 渲染器含 record 展开逻辑与条数脚注模板
+        self.assertIn('class="msg-record"', html)
+        self.assertIn("rec.count || items.length", html)
+
+    @staticmethod
+    def _chat_data(msgs):
+        from siwx.html_template import build_chat_data
+        session = {"wxid": "room", "displayName": "会话", "isGroup": False,
+                   "firstTimestamp": 1, "lastTimestamp": 1, "ownerId": "o",
+                   "messageCount": len(msgs)}
+        return build_chat_data(session, msgs, {})
+
+
+# ── 31. P2：fallback_labels 精确判定（前缀误报修复）────────────────
+
+class TestFallbackExactMatch(unittest.TestCase):
+    """P2-1 回归：合法链接卡 "[链接] 标题"、合并转发 "[聊天记录] 标题（N 条…）"
+    曾被 startswith 前缀判定误计为兜底文案；修复后只有恰等于兜底标签原文
+    （解析真失败）或 "[类型N]" 才计数。"""
+
+    def _observe(self, content, t=49):
+        from siwx.exporter import _ExportStats
+        st = _ExportStats()
+        st.observe({"localType": t, "content": content, "localId": 1,
+                    "createTime": 0, "rawContent": ""})
+        return st.fallback_labels
+
+    def test_prefixed_success_not_fallback(self):
+        self.assertEqual(self._observe("[链接] 文章标题"), 0)
+        self.assertEqual(self._observe("[聊天记录] 群聊的聊天记录（3 条：a: b）"), 0)
+        self.assertEqual(self._observe("[转账] 请收款"), 0)
+
+    def test_exact_label_is_fallback(self):
+        self.assertEqual(self._observe("[链接]"), 1)
+        self.assertEqual(self._observe("[引用]", t=57), 1)
+
+    def test_unknown_type_pattern_is_fallback(self):
+        self.assertEqual(self._observe("[类型4321]", t=4321), 1)
+
+
+class TestWxgfSubprocessAndIntegrity(unittest.TestCase):
+    """wxgf 转码子进程隔离 + 解密产物完整性（2026-10-06 家族群占位符排查）。
+
+    背景：VoipEngine.dll 在长驻进程内随机 access violation（crash.log
+    2026-10-05 21:51 整进程崩溃），旧实现把转码失败的原始 wxgf 以 200 +
+    image/wxgf 透传且写入缓存 → 浏览器解码失败显示"原图未下载"、重试无效。
+    """
+
+    def test_finalize_wxgf_failure_returns_none(self):
+        """转码失败必须返回 None，绝不透传 wxgf 字节。"""
+        from siwx import media
+        orig = media.convert_wxgf
+        media.convert_wxgf = lambda data: None
+        try:
+            self.assertIsNone(media._finalize(b"wxgf\x13\x00", "wxgf", "image/wxgf"))
+        finally:
+            media.convert_wxgf = orig
+
+    def test_finalize_wxgf_success(self):
+        from siwx import media
+        orig = media.convert_wxgf
+        media.convert_wxgf = lambda data: b"\xff\xd8\xff\xd9"
+        try:
+            body, ext, ctype = media._finalize(b"wxgf\x13\x00", "wxgf", "image/wxgf")
+            self.assertEqual((body, ext, ctype), (b"\xff\xd8\xff\xd9", "jpeg", "image/jpeg"))
+        finally:
+            media.convert_wxgf = orig
+
+    def test_plausible_image_jpeg_tail(self):
+        from siwx import media
+        self.assertTrue(media._plausible_image(b"\xff\xd8\xff" + b"\x00" * 100 + b"\xff\xd9"))
+        # 转码产物尾部带填充（实测 DLL 在 FFD9 后附 26B）仍应通过
+        padded = b"\xff\xd8\xff" + b"\x00" * 100 + b"\xff\xd9" + b"\x00" * 26
+        self.assertTrue(media._plausible_image(padded))
+        # 半截文件（白熊图 _h.dat 形态：头好尾坏）必须拒绝
+        self.assertFalse(media._plausible_image(b"\xff\xd8\xff" + b"\x00" * 100))
+
+    def test_plausible_image_png_gif(self):
+        from siwx import media
+        self.assertTrue(media._plausible_image(b"\x89PNG" + b"\x00" * 50 + b"IEND" + b"\x00" * 4))
+        self.assertFalse(media._plausible_image(b"\x89PNG" + b"\x00" * 64))
+        self.assertTrue(media._plausible_image(b"GIF89a" + b"\x00" * 20 + b"\x3b"))
+        self.assertFalse(media._plausible_image(b"GIF89a" + b"\x00" * 20))
+
+    def test_worker_only_accepts_converted_output(self):
+        """worker 的有效签名表不含 wxgf：wxgf→wxgf 视为失败，杜绝透传回归。"""
+        from siwx import media
+        sigs_line = [l for l in media._WXGF_WORKER.splitlines()
+                     if l.startswith("_SIGS")][0]
+        self.assertNotIn("wxgf", sigs_line)
+
+
+class TestAuditFixes20261006(TempRootCase):
+    """2026-10-06 审计复核结论的回归：信任边界、失败契约、导出页渲染、媒体定位。"""
+
+    @staticmethod
+    def _client():
+        from siwx.server import app
+        return app.test_client()
+
+    # ── 信任边界 ──────────────────────────────────────────────
+
+    def test_validate_account_rejects_traversal(self):
+        from siwx import validate
+        # 正则本身允许 "."（账号名里有它），穿越必须靠 resolve()+relative_to 兜住
+        self.assertTrue(validate.valid_account(".."))
+        self.assertIsNone(validate.account_dir(".."))
+        self.assertIsNone(validate.account_dir("../x"))
+        for bad in ("a/b", "a\\b", "", None, 123, "C:/Windows"):
+            self.assertFalse(validate.valid_account(bad), bad)
+            self.assertIsNone(validate.account_dir(bad), bad)
+        self.assertTrue(validate.valid_account("wxid_abc_1234"))
+        self.assertTrue(validate.valid_account("wxalias_example_01"))
+
+    def test_settings_clear_rejects_path_wxid(self):
+        """POST /api/settings/clear 的 wxid 此前裸拼路径，可 rmtree 任意目录。"""
+        from siwx.server import app
+        r = app.test_client().post("/api/settings/clear",
+                                   json={"kind": "output", "wxid": "C:/Windows"})
+        self.assertEqual(r.status_code, 400)
+
+    def test_run_rejects_out_dir_outside_output_root(self):
+        from siwx.server import app
+        r = app.test_client().post("/api/run", json={
+            "mode": "export", "out_dir": str(self.tmp / "elsewhere")})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("out_dir", r.get_json()["error"])
+
+    def test_run_rejects_unrecognized_db_dir(self):
+        from siwx.server import app
+        r = app.test_client().post("/api/run", json={
+            "mode": "auto", "db_dir": str(self.tmp / "not-a-wechat-dir")})
+        self.assertEqual(r.status_code, 400)
+
+    def test_sns_emoji_rejects_non_cdn_url(self):
+        """表情 url 来自好友评论 XML，属于 GET 参数，必须过 CDN 白名单。"""
+        import json as _json
+        from siwx.server import app
+        spec = _json.dumps({"url": "http://169.254.169.254/latest/meta-data/"})
+        r = app.test_client().get("/api/sns/emoji", query_string={"emoji": spec})
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(r.get_json().get("reason"), "not-cdn")
+
+    def test_artifact_origin_pinned_to_repo_path(self):
+        from siwx import auto_update
+        self.assertTrue(auto_update._manifest_url_allowed(
+            "https://github.com/ImUpXuu/SIWX/releases/download/v5.0.6/x.exe"))
+        # 只校验 host 时 github.com/attacker/... 也会放行 —— 必须拒绝
+        self.assertFalse(auto_update._manifest_url_allowed(
+            "https://github.com/attacker/SIWX/releases/download/v1/evil.exe"))
+        self.assertFalse(auto_update._manifest_url_allowed("https://evil.com/x.exe"))
+        self.assertFalse(auto_update._manifest_url_allowed(""))
+        # P2-4：明文 http 拒绝；P2-5：objects 域拒绝
+        self.assertFalse(auto_update._manifest_url_allowed(
+            "http://github.com/ImUpXuu/SIWX/releases/download/v5.0.6/x.exe"))
+        self.assertFalse(auto_update._manifest_url_allowed(
+            "https://objects.githubusercontent.com/s3-signed/x.exe"))
+
+    def test_version_field_must_be_semver(self):
+        """version 会拼进文件名/安装目标/正则替换模板，必须严格校验。"""
+        from siwx import auto_update
+        self.assertTrue(auto_update.valid_version("5.0.7"))
+        self.assertTrue(auto_update.valid_version("5.0.7-rc1"))
+        for bad in ("9.9.9/../../../../Startup/evil", "5.0", "", None, "v5.0.7", ".."):
+            self.assertFalse(auto_update.valid_version(bad), bad)
+
+    def test_cdn_fetch_verifies_tls(self):
+        """生产媒体链路默认必须校验证书（此前 check_hostname=False + CERT_NONE）。"""
+        src = (ROOT / "siwx" / "sns_cdn.py").read_text(encoding="utf-8")
+        self.assertNotIn("verify_mode = ssl.CERT_NONE", src)
+        self.assertNotIn("ctx.check_hostname = False", src)
+        self.assertIn("ctx = ssl.create_default_context()", src)
+
+    # ── 失败契约 ──────────────────────────────────────────────
+
+    def test_job_exposes_error_field(self):
+        """前端四处（export/settings/onboarding）判 job.error，此前该字段从不返回。"""
+        from siwx import server
+        with server._lock:
+            server._job.update({"error": "RuntimeError: boom", "ok": False,
+                                "done": True, "running": False, "logs": [], "report": None})
+        try:
+            body = server.app.test_client().get("/api/job").get_json()
+            self.assertEqual(body["error"], "RuntimeError: boom")
+        finally:
+            with server._lock:
+                server._job.update({"error": None, "ok": False, "done": False,
+                                    "running": False, "logs": [], "report": None})
+
+    def test_start_job_poll_survives_transient_failure(self):
+        """common.js 的 startJob：单次 fetch 失败不得终止轮询（旧实现 return 掉）。"""
+        src = (ROOT / "siwx" / "ui" / "common.js").read_text(encoding="utf-8")
+        self.assertIn("failStreak", src)
+        self.assertIn("与后端失去联系", src)
+
+    def test_messages_rejects_non_numeric_cursor(self):
+        """裸 int() 会把客户端参数错误变成 500 + 完整 traceback 回显。"""
+        acc, account, chat = make_account(self.tmp, n_texts=1)
+        c = self._client()
+        for qs in ("before=abc", "before_id=abc", "after=abc", "after_id=abc", "limit=abc"):
+            r = c.get(f"/api/chat/messages?account={account}&chat={chat}&{qs}")
+            self.assertEqual(r.status_code, 400, qs)
+            self.assertIn("参数无效", r.get_json()["error"])
+        # 合法参数仍然 200
+        self.assertEqual(c.get(
+            f"/api/chat/messages?account={account}&chat={chat}&limit=10").status_code, 200)
+
+    def test_logs_limit_non_numeric_400(self):
+        self.assertEqual(self._client().get("/api/logs?limit=abc").status_code, 400)
+
+    def test_logs_export_shares_log_page_sources(self):
+        """日志导出与日志页同源（此前导出只有进程内 _FILE_LOG，重启即空）。"""
+        from siwx import server, logger as _logger
+        _logger.rough("test", "导出同源校验标记 XYZ")
+        text = self._client().get("/api/logs/export").get_data(as_text=True)
+        self.assertIn("XYZ", text)
+        self.assertIn("] [", text)
+
+    def test_sns_export_empty_is_not_a_failure(self):
+        """"没有符合条件的动态"是空结果，不是失败（旧实现 ok=False → 红错态）。"""
+        from siwx import sns_export
+        old = sns_export._iter_feeds
+        try:
+            sns_export._iter_feeds = lambda *a, **k: iter(())
+            res = sns_export.run_sns_export(self.tmp / "sns.db", "wxalias_example_01", fmt="json")
+        finally:
+            sns_export._iter_feeds = old
+        self.assertTrue(res["ok"])
+        self.assertTrue(res["empty"])
+        self.assertEqual(res["count"], 0)
+
+    # ── 数据正确性 ────────────────────────────────────────────
+
+    def test_chat_count_dedupes_shards(self):
+        """一个会话的表散在多个分片时，会话数只能算 1（旧实现 2.39× 虚高）。"""
+        acc, account, chat = make_account(self.tmp, n_texts=3)
+        make_shard(acc / "message" / "message_1.db", chat, ["另一个分片的同会话消息"],
+                   start_ts=1_700_000_100)
+        from siwx import stats
+        raw = stats.compute_stats(account, force=True)
+        self.assertEqual(raw["chat_count"], 1)
+        self.assertEqual(stats.summarize(raw)["chat_count"], 1)
+
+    def test_stats_range_filter_scopes_chat_count(self):
+        """会话数必须跟随日期筛选（旧实现取全量值，无视区间）。"""
+        from siwx import stats
+        acc, account, chat = make_account(self.tmp, n_texts=3)
+        # 另一个会话，时间戳落在 2020 年（默认夹具在 2023-11）
+        make_shard(acc / "message" / "message_1.db", "wxid_other", ["别的时间段"],
+                   start_ts=1_600_000_000)
+        raw = stats.compute_stats(account, force=True)
+        self.assertEqual(raw["chat_count"], 2)
+        only_2023 = stats.summarize(raw, start="2023-01-01", end="2023-12-31")
+        self.assertEqual(only_2023["chat_count"], 1)
+        only_2020 = stats.summarize(raw, start="2020-01-01", end="2020-12-31")
+        self.assertEqual(only_2020["chat_count"], 1)
+
+    def test_voice_does_not_leak_across_sessions(self):
+        """不同会话共享同一 local_id 时，跨分片查找不得捞到别的会话的语音。
+
+        构造：目标语音在 media_0.db，media_1.db 里有一条 chat_name_id 属于别的
+        会话、但 local_id 相同的记录。media_1 先被遍历（倒序 glob），带会话
+        约束的查询不会命中诱饵（chat_name_id 不符），必须继续走到 media_0。
+
+        注：两个分片的 Name2Id 都在——真实 media_*.db 一律携带 Name2Id；
+        会话在某分片查不到映射时，宁可不命中也不能裸 local_id 串音
+        （issue #40 的根因，见 TestVoiceMedia 的回归）。"""
+        from siwx import voice
+        acc, account, chat = make_account(self.tmp, n_texts=1)
+        msg_dir = acc / "message"
+
+        decoy = msg_dir / "media_1.db"
+        conn = sqlite3.connect(decoy)
+        conn.execute("CREATE TABLE Name2Id (user_name TEXT)")
+        conn.execute("INSERT INTO Name2Id(rowid, user_name) VALUES (1, ?)", (chat,))
+        conn.execute("CREATE TABLE VoiceInfo (chat_name_id INTEGER, create_time INTEGER, "
+                     "local_id INTEGER, svr_id INTEGER, voice_data BLOB, data_index TEXT)")
+        conn.execute("INSERT INTO VoiceInfo VALUES (?,?,?,?,?,?)",
+                     (2, 1_700_000_000, 9, 0, b"\x02#!SILK_V3WRONG", "0"))
+        conn.commit(); conn.close()
+
+        conn = sqlite3.connect(msg_dir / "media_0.db")
+        conn.execute("CREATE TABLE Name2Id (user_name TEXT)")
+        conn.execute("INSERT INTO Name2Id(rowid, user_name) VALUES (1, ?)", (chat,))
+        conn.execute("CREATE TABLE VoiceInfo (chat_name_id INTEGER, create_time INTEGER, "
+                     "local_id INTEGER, svr_id INTEGER, voice_data BLOB, data_index TEXT)")
+        conn.execute("INSERT INTO VoiceInfo VALUES (?,?,?,?,?,?)",
+                     (1, 1_700_000_000, 9, 0, b"\x02#!SILK_V3RIGHT", "0"))
+        conn.commit(); conn.close()
+
+        data, _info = voice.get_voice(acc, chat=chat, local_id=9, svr_id=0, ts=0)
+        self.assertEqual(data, b"#!SILK_V3RIGHT")
+
+    def test_extract_md5_ignores_longer_attributes(self):
+        """originsourcemd5 等属性名里含 md5=，必须有左边界。"""
+        from siwx import media
+        real, decoy = "b" * 32, "a" * 32
+        self.assertEqual(
+            media.extract_md5_from_xml(f'<msg originsourcemd5="{decoy}" md5="{real}"/>'),
+            real)
+        self.assertIsNone(media.extract_md5_from_xml(
+            f'<msg originsourcemd5="{decoy}"/>'))
+        self.assertIsNone(media.extract_md5_from_xml(f'<msg androidmd5="{decoy}"/>'))
+
+    def test_bubble_paths_match_exact_local_id_and_ts(self):
+        """<id>*.dat 会命中 91_… 等同目录兄弟文件，必须带下划线边界与 ts。"""
+        from siwx import media
+        root = self.tmp / "cache"
+        target = hashlib.md5(b"wxid_demo_b").hexdigest()
+        d = root / "2025-01" / "Message" / target / "Bubble"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "9_1700000000_b.dat").write_bytes(b"x")
+        (d / "91_1700000000_b.dat").write_bytes(b"y")
+        old_find = media._wechat_cache_roots
+        media._CACHE_ROOTS_MEMO.clear()
+        try:
+            media._wechat_cache_roots = lambda _wxid: [root]
+            got = media.bubble_paths("wxid_demo_b", "wxid_demo_b", 9, 1_700_000_000)
+        finally:
+            media._wechat_cache_roots = old_find
+            media._CACHE_ROOTS_MEMO.clear()
+        self.assertEqual([p.name for p in got], ["9_1700000000_b.dat"])
+
+    def test_save_key_cache_uses_unique_temp_name(self):
+        """固定 media_key.tmp 在多进程导出下会互相踩（写坏即丢全部派生密钥）。"""
+        from siwx import media
+        src = (ROOT / "siwx" / "media.py").read_text(encoding="utf-8")
+        self.assertIn("mkstemp", src)
+        self.assertNotIn('p.with_suffix(".tmp")', src)
+
+    def test_index_and_type_filter_regressions(self):
+        """导出页类型的类型筛选与 href scheme 白名单（A-7 / A-4）。"""
+        src = (ROOT / "siwx" / "templates" / "default" / "renderer.js").read_text(encoding="utf-8")
+        # activeTypes 必须与 m.type（数值）同型，否则 Set.has 恒假、列表被清空
+        self.assertIn("activeTypes.has(Number(t.dataset.type))", src)
+        self.assertIn("Number(this.dataset.type)", src)
+        # 链接卡 href 必须过 scheme 白名单
+        self.assertIn("function safeUrl(", src)
+        self.assertIn("var href = safeUrl(url);", src)
+
+    def test_decode_content_degrades_visibly(self):
+        from siwx import api_chat
+        out = api_chat._decode_content(b"\xff\xfeabc")
+        self.assertTrue(out)                      # 不再整条置空
+        self.assertIn("abc", out)
+        self.assertNotEqual(api_chat._decode_content(b"\x28\xb5\x2f\xfdbroken"), "")
+
+    def test_xlsx_writer_is_streaming(self):
+        from siwx import exporter
+        src = (ROOT / "siwx" / "exporter.py").read_text(encoding="utf-8")
+        self.assertIn("Workbook(write_only=True)", src)
+
+
+# ── 32. None 解引用加固（手改配置/异常库值）─────────────────────
+
+class TestNullConfigHardening(TempRootCase):
+    """手改 mcp_config.json 把 "tools" 写成 null 时，`.get("tools", {})`
+    拿到的是 None（键存在值为 null，默认值不生效）→ 每一次 MCP 工具调用
+    与 /api/mcp/info 都会 AttributeError。加固后必须正常降级。"""
+
+    def _write_null_tools_config(self):
+        import json as _json
+        from siwx import mcp_server
+        p = mcp_server.config_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(_json.dumps({"tools": None}), encoding="utf-8")
+
+    def test_tool_enabled_with_null_tools(self):
+        from siwx import mcp_server
+        self._write_null_tools_config()
+        self.assertTrue(mcp_server.tool_enabled("get_status"))
+
+    def test_mcp_info_endpoint_with_null_tools(self):
+        from siwx.server import app
+        self._write_null_tools_config()
+        c = app.test_client()
+        r = c.get("/api/mcp/info")
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("tools", r.get_json())
+
+
+# ── 23. macOS 支持（kvcomm 密钥发现 + wxgf 留档）─────────────────
+
+class TestFindKvcommCodesMacOS(unittest.TestCase):
+    """find_kvcomm_codes() 此前只扫 Windows 路径 (C:/Users/*/AppData/...)，
+    macOS 上恒返回空列表 → candidate_keys() 恒无候选 → 账号级媒体密钥永远
+    推导不出来 → 所有聊天/朋友圈图片解密失败（P0-1，吸收自 PR #28）。"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="siwx_test_kvcomm_"))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_macos_container_kvcomm_discovered(self):
+        from siwx import media
+        kv = (self.tmp / "Library" / "Containers" / "com.tencent.xinWeChat" /
+              "Data" / "Documents" / "app_data" / "net" / "kvcomm")
+        kv.mkdir(parents=True)
+        (kv / "key_3377726147_4066647381_1_1_1_3600_input.statistic").write_bytes(b"")
+        # 非数字 code 的同名兄弟文件不应被误当成 code 命中
+        (kv / "key_reportnow_1_2_3_4_5_input.statistic").write_bytes(b"")
+
+        def fake_glob(pat):
+            # 本机真实 kvcomm 文件会污染断言，只放行打中夹具目录的模式
+            return [str(f) for f in kv.glob("key_*_*.statistic")] \
+                if str(kv) in pat else []
+
+        with mock.patch("siwx.media.platform.system", return_value="Darwin"), \
+             mock.patch("siwx.media.Path.home", return_value=self.tmp), \
+             mock.patch("glob.glob", side_effect=fake_glob):
+            codes = media.find_kvcomm_codes()
+        self.assertEqual(codes, [3377726147])
+
+    def test_no_container_dir_returns_empty_not_raises(self):
+        from siwx import media
+        with mock.patch("siwx.media.platform.system", return_value="Darwin"), \
+             mock.patch("siwx.media.Path.home", return_value=self.tmp), \
+             mock.patch("glob.glob", return_value=[]):
+            self.assertEqual(media.find_kvcomm_codes(), [])
+
+    def test_windows_path_unaffected(self):
+        """非 Darwin 平台不应触碰 macOS 专属逻辑（回归保护，防止条件写反）。"""
+        from siwx import media
+        with mock.patch("siwx.media.platform.system", return_value="Windows"), \
+             mock.patch("glob.glob", return_value=[]):
+            self.assertEqual(media.find_kvcomm_codes(), [])
+
+
+class TestImageFailReason(TempRootCase):
+    """P2-7：/api/chat/media/image 的 404 必须带结构化 reason，前端据此
+    区分「没下载原图 / 解密失败 / 本平台无法解码」，不再只有一种文案。"""
+
+    def setUp(self):
+        super().setUp()
+        self.acc, self.account, self.chat = make_account(self.tmp, n_texts=6)
+
+    def test_reason_field_classifies_failures(self):
+        from siwx import media
+        from siwx.server import app
+        cases = [
+            ("未找到文件", "missing_local"),
+            ("文件不存在: x.dat", "missing_local"),
+            ("本地无原图/气泡/缩略图", "missing_local"),
+            ("wxgf 转码失败（原始文件已留档: wxgf_archive/a.wxgf）",
+             "no_decoder_on_platform"),
+            ("V2 密钥未命中（请确认微信已登录过该账号）", "decrypt_failed"),
+            ("解密产物不完整", "decrypt_failed"),
+        ]
+        old = media.get_image
+        try:
+            for err, want in cases:
+                media.get_image = lambda *a, **kw: (None, err)
+                r = app.test_client().get(
+                    f"/api/chat/media/image?account={self.account}&md5={'a' * 32}")
+                self.assertEqual(r.status_code, 404)
+                self.assertEqual(r.get_json()["reason"], want, err)
+        finally:
+            media.get_image = old
+
+
+class TestWxgfArchiveOnDecodeFailure(TempRootCase):
+    """P0-1②：wxgf 解码失败时，已解密的原始字节必须留档到输出目录
+    （wxgf_archive/）而不是直接丢弃，失败原因需带留档位置透传给用户。"""
+
+    def setUp(self):
+        super().setUp()
+        self.acc, self.account, self.chat = make_account(self.tmp, n_texts=6)
+
+    def test_decode_failure_archives_raw_wxgf(self):
+        import hashlib
+        from siwx import media
+        root = self.tmp / "acc_root"
+        (root / "cache").mkdir(parents=True)
+        attach = (root / "msg" / "attach"
+                  / hashlib.md5(self.chat.encode()).hexdigest() / "Img")
+        attach.mkdir(parents=True)
+        raw = b"wxgf" + b"\x00" * 32
+        (attach / ("d" * 32 + ".dat")).write_bytes(raw)
+
+        old_roots, old_dec, old_conv = (media._wechat_cache_roots,
+                                        media._decrypt_any, media.convert_wxgf)
+        media._wechat_cache_roots = lambda wxid: [root / "cache"]
+        media._decrypt_any = lambda data, wxid: (raw, "image/wxgf")
+        media.convert_wxgf = lambda data: None
+        try:
+            body, info = media.get_image(self.account, "d" * 32,
+                                         self.tmp / "out", chat=self.chat)
+            self.assertIsNone(body)
+            self.assertIn("留档", info)
+            archived = self.tmp / "out" / "wxgf_archive" / ("d" * 32 + ".wxgf")
+            self.assertTrue(archived.is_file())
+            self.assertEqual(archived.read_bytes(), raw)
+        finally:
+            media._wechat_cache_roots = old_roots
+            media._decrypt_any = old_dec
+            media.convert_wxgf = old_conv
+
+    def test_decode_success_does_not_archive(self):
+        """解码成功时不应产生留档文件。"""
+        import hashlib
+        from siwx import media
+        root = self.tmp / "acc_root"
+        (root / "cache").mkdir(parents=True)
+        attach = (root / "msg" / "attach"
+                  / hashlib.md5(self.chat.encode()).hexdigest() / "Img")
+        attach.mkdir(parents=True)
+        raw = b"wxgf" + b"\x00" * 32
+        (attach / ("e" * 32 + ".dat")).write_bytes(raw)
+
+        old_roots, old_dec, old_conv = (media._wechat_cache_roots,
+                                        media._decrypt_any, media.convert_wxgf)
+        media._wechat_cache_roots = lambda wxid: [root / "cache"]
+        media._decrypt_any = lambda data, wxid: (raw, "image/wxgf")
+        media.convert_wxgf = lambda data: b"\xff\xd8\xff" + b"\x00" * 40
+        try:
+            body, info = media.get_image(self.account, "e" * 32,
+                                         self.tmp / "out", chat=self.chat)
+            self.assertIsNotNone(body)
+            out_dir = self.tmp / "out" / "wxgf_archive"
+            self.assertFalse(out_dir.exists())
+        finally:
+            media._wechat_cache_roots = old_roots
+            media._decrypt_any = old_dec
+            media.convert_wxgf = old_conv
+
+
+# ── 24. 全量媒体备份（media_backup，吸收自 PR #28）───────────────
+
+class TestMediaBackup(unittest.TestCase):
+    """按文件系统枚举的全量备份：不依赖消息解析，保证文件级 100% 覆盖。"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="siwx_test_mediabackup_"))
+        self.wxid = "wxid_demo_b"
+        self.account_root = self.tmp / "xwechat_files" / self.wxid
+        (self.account_root / "cache").mkdir(parents=True)
+        self.attach_root = (self.account_root / "msg" / "attach" / "chatmd5"
+                            / "2026-01" / "Img")
+        self.attach_root.mkdir(parents=True)
+        self.video_root = self.account_root / "msg" / "video" / "2026-01"
+        self.video_root.mkdir(parents=True)
+        self.file_root = self.account_root / "msg" / "file" / "2026-01"
+        self.file_root.mkdir(parents=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _patch_roots(self):
+        return mock.patch("siwx.media._wechat_cache_roots",
+                          return_value=[self.account_root / "cache"])
+
+    def test_images_classified_by_content_type(self):
+        """可预览(jpeg) / wxgf 转码失败后原样保留 / 真失败，三种结果各自
+        正确归类，wxgf 不被误标成打不开的假 jpg。"""
+        from siwx import media_backup
+        (self.attach_root / "a.dat").write_bytes(b"fake-jpeg-bytes")
+        (self.attach_root / "b.dat").write_bytes(b"fake-wxgf-bytes")
+        (self.attach_root / "c.dat").write_bytes(b"fake-fail-bytes")
+
+        def fake_decrypt_any(data, wxid):
+            if data == b"fake-jpeg-bytes":
+                return b"\xff\xd8\xff" + b"\x00" * 10, "image/jpeg"
+            if data == b"fake-wxgf-bytes":
+                return b"wxgf" + b"\x00" * 10, "image/wxgf"
+            return None, None
+
+        with self._patch_roots(), \
+             mock.patch("siwx.media._decrypt_any", side_effect=fake_decrypt_any), \
+             mock.patch("siwx.media_backup.platform.system", return_value="Linux"), \
+             mock.patch("siwx.media.convert_wxgf", return_value=None):
+            stats = media_backup.backup_images(self.wxid, self.tmp / "out_images",
+                                               log=None)
+
+        self.assertEqual(stats["total"], 3)
+        self.assertEqual(stats["ok_viewable"], 1)
+        self.assertEqual(stats["ok_wxgf_preserved"], 1)
+        self.assertEqual(stats["failed"], 1)
+        out_dir = self.tmp / "out_images" / "chatmd5" / "2026-01" / "Img"
+        self.assertTrue((out_dir / "a.jpeg").is_file())
+        self.assertTrue((out_dir / "b.wxgf").is_file())
+        self.assertFalse((out_dir / "c.jpeg").exists())
+        self.assertFalse((out_dir / "c.wxgf").exists())
+
+    def test_videos_copied_without_decryption(self):
+        """视频实测未加密（ISO Media/MP4 容器），原样复制，不经 media._decrypt_any。"""
+        from siwx import media_backup
+        raw = b"\x00\x00\x00\x20ftypisom" + b"\x00" * 20
+        (self.video_root / "x.mp4").write_bytes(raw)
+
+        with self._patch_roots():
+            stats = media_backup.backup_videos(self.wxid, self.tmp / "out_videos",
+                                               log=None)
+
+        self.assertEqual(stats["total"], 1)
+        self.assertEqual(stats["ok"], 1)
+        self.assertEqual(stats["failed"], 0)
+        out_file = self.tmp / "out_videos" / "2026-01" / "x.mp4"
+        self.assertTrue(out_file.is_file())
+        self.assertEqual(out_file.read_bytes(), raw)
+
+    def test_rerun_on_readonly_source_video_does_not_fail(self):
+        """实测踩坑：微信落盘的源视频本身只读。copy2() 连权限位一起拷到
+        目标后，重跑备份对同名只读目标再 copy2() 就是 PermissionError
+        （实测 1926 个视频 1913 个这样假性失败）。必须按大小跳过。"""
+        from siwx import media_backup
+        raw = b"\x00\x00\x00\x20ftypisom" + b"\x00" * 20
+        src = self.video_root / "x.mp4"
+        src.write_bytes(raw)
+        src.chmod(0o444)  # 源文件只读，与微信实测落盘权限一致
+        dst = self.tmp / "out_videos" / "2026-01" / "x.mp4"
+        dst.parent.mkdir(parents=True)
+        dst.write_bytes(raw)
+        dst.chmod(0o444)  # 模拟第一次备份后、被 copy2() 带只读的旧产物
+
+        with self._patch_roots():
+            stats = media_backup.backup_videos(self.wxid, self.tmp / "out_videos",
+                                               log=None)
+
+        self.assertEqual(stats["failed"], 0)
+        self.assertEqual(stats["skipped"], 1)
+        self.assertEqual(dst.read_bytes(), raw)
+
+    def test_backup_all_combines_images_and_videos(self):
+        from siwx import media_backup
+        (self.attach_root / "a.dat").write_bytes(b"fake-jpeg-bytes")
+        (self.video_root / "x.mp4").write_bytes(b"videobytes")
+        (self.file_root / "report.pdf").write_bytes(b"%PDF-1.7 fake pdf bytes")
+
+        with self._patch_roots(), \
+             mock.patch("siwx.media._decrypt_any",
+                        return_value=(b"\xff\xd8\xff" + b"\x00" * 10, "image/jpeg")):
+            report = media_backup.backup_all(self.wxid, self.tmp / "out_all", log=None)
+
+        self.assertEqual(report["images"]["ok_viewable"], 1)
+        self.assertEqual(report["videos"]["ok"], 1)
+        self.assertEqual(report["files"]["ok"], 1)
+
+    def test_files_copied_without_decryption_keeps_original_name(self):
+        """msg/file 下的文件消息附件未加密、原文件名/扩展名原样保留在磁盘上，
+        直接复制即可，不经 media._decrypt_any。"""
+        from siwx import media_backup
+        raw = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n" + b"\x00" * 20
+        (self.file_root / "示例文档(1).pdf").write_bytes(raw)
+
+        with self._patch_roots():
+            stats = media_backup.backup_files(self.wxid, self.tmp / "out_files",
+                                              log=None)
+
+        self.assertEqual(stats["total"], 1)
+        self.assertEqual(stats["ok"], 1)
+        self.assertTrue((self.tmp / "out_files" / "2026-01" / "示例文档(1).pdf").is_file())
+
+
+class TestMediaBackupApi(TempRootCase):
+    """/api/media/backup/* 端点：启动 → 轮询 → 目录打开的面子。"""
+
+    def setUp(self):
+        super().setUp()
+        self.acc, self.account, self.chat = make_account(self.tmp, n_texts=6)
+
+    def test_start_rejects_unknown_account(self):
+        from siwx.server import app
+        r = app.test_client().post("/api/media/backup/start",
+                                   json={"account": "wxid_nope"})
+        self.assertEqual(r.status_code, 404)
+
+    def test_start_rejects_missing_account_param(self):
+        from siwx.server import app
+        r = app.test_client().post("/api/media/backup/start", json={})
+        self.assertEqual(r.status_code, 400)
+
+    def test_backup_job_runs_to_done(self):
+        from siwx import server
+        from unittest import mock as _mock
+        client = app = server.app.test_client()
+        # 账号目录里没有 cache/ 也没有 msg/*：P2-9 后必须显式失败，
+        # 不能再以 0/0 统计伪装成“备份完成”。
+        with _mock.patch.object(server.validate, "account_dir",
+                                return_value=self.tmp / "out" / self.account):
+            r = client.post("/api/media/backup/start", json={"account": self.account})
+            self.assertEqual(r.status_code, 200)
+            for _ in range(50):
+                st = client.get("/api/media/backup/status").get_json()
+                if not st["running"]:
+                    break
+                time.sleep(0.05)
+        self.assertTrue(st["done"])
+        self.assertFalse(st["ok"], "缺账号数据目录时不得报告成功")
+        self.assertIn("未找到账号数据目录", st.get("error") or "")
+        self.assertIn("images", st["report"])
+        self.assertEqual(st["report"]["images"]["total"], 0)
+
+
+# ── Thumb 缩略图必须带 ts 限定（local_id 跨年撞号 → 错图顶替） ──────
+
+class TestThumbTsGuard(TempRootCase):
+    """cache Thumb 命名实测统一为 {local_id}_{ts}_thumb.jpg，但消息按月分库、
+    local_id 每月重排：同会话不同年份会撞号（真实事故：local_id=45 同时是
+    2020-03 的图片消息与 2025-09 的视频号消息）。旧实现裸 {local_id}_* 在
+    原图三级来源全部清理后，把 2025 年视频号封面静默配给了 2020 年的图片
+    消息（错图比缺图严重）。与 bubble_paths 同族缺陷，同修。"""
+
+    WRONG_TS = 1_752_000_000   # 另一年那条撞号消息的 ts
+    RIGHT_TS = 1_583_000_000   # 本消息 ts
+
+    def setUp(self):
+        super().setUp()
+        from siwx import media
+        self.media = media
+        chat = "wxid_test_friend"
+        self.chat = chat
+        self.cache = self.tmp / "cache"
+        thumb_dir = (self.cache / "2099-01" / "Message" /
+                     hashlib.md5(chat.encode()).hexdigest() / "Thumb")
+        thumb_dir.mkdir(parents=True)
+        self.wrong = thumb_dir / f"45_{self.WRONG_TS}_thumb.jpg"
+        self.right = thumb_dir / f"45_{self.RIGHT_TS}_thumb.jpg"
+        # 内容随意：thumb_paths 只做文件级匹配
+        self.wrong.write_bytes(b"\xff\xd8\xffwrong")
+        self.right.write_bytes(b"\xff\xd8\xffright")
+        ro = mock.patch.object(media, "_wechat_cache_roots",
+                               return_value=[self.cache])
+        ro.start()
+        self.addCleanup(ro.stop)
+
+    def test_same_local_id_other_year_is_not_matched(self):
+        """local_id 撞号：只允许命中同 ts 的缩略图。"""
+        got = self.media.thumb_paths("wxid_test_me", self.chat, 45, self.RIGHT_TS)
+        self.assertEqual([p.name for p in got], [self.right.name])
+
+    def test_missing_thumb_never_falls_back_to_wrong_year(self):
+        """本消息缩略图不存在时返回空——宁缺勿错，不许拿别年消息的顶替。"""
+        self.right.unlink()
+        got = self.media.thumb_paths("wxid_test_me", self.chat, 45, self.RIGHT_TS)
+        self.assertEqual(got, [])
+
+    def test_ts_missing_keeps_bare_prefix_fallback(self):
+        """ts 缺失（无法消歧）维持旧裸前缀行为，与 bubble_paths 对齐。"""
+        got = self.media.thumb_paths("wxid_test_me", self.chat, 45, None)
+        self.assertEqual(sorted(p.name for p in got),
+                         sorted([self.wrong.name, self.right.name]))
+
+
+# ── 25. 协作式取消 + 视频号导出卡片 + 方案 A 转换报告 ─────────────
+
+class TestExportCancel(unittest.TestCase):
+    """协作式取消（台账 §二-2）：多会话导出优雅停止，报告带 cancelled，
+    已完成会话的产物语义保留（以假 run_export 验证循环与报告逻辑）。"""
+
+    def test_cancelled_midway_raises_and_reports(self):
+        """第 2 个会话抛 ExportCancelled → 停止循环，cancelled=True、ok_count=1。"""
+        from siwx import exporter
+        calls = []
+
+        def fake_run(*a, **k):
+            calls.append(k.get("folder_name"))
+            if len(calls) == 1:
+                return {"message_count": 5, "duration_ms": 1}
+            raise exporter.ExportCancelled("导出已取消")
+
+        with mock.patch.object(exporter, "run_export", side_effect=fake_run), \
+             tempfile.TemporaryDirectory() as td:
+            res = exporter.run_export_multi(
+                Path(td), "wxid_test_owner",
+                [{"chat": "wxid_test_a", "display": "A"},
+                 {"chat": "wxid_test_b", "display": "B"},
+                 {"chat": "wxid_test_c", "display": "C"}],
+                fmt="json", progress=lambda p, m: None)
+        self.assertTrue(res["cancelled"])
+        self.assertEqual(res["ok_count"], 1)
+        self.assertEqual(len(res["sessions"]), 1)
+        self.assertEqual(calls, ["01_A", "02_B"])  # 会话 2 执行中取消，会话 3 未启动
+
+    def test_flag_checked_before_each_chat(self):
+        """取消探针在每个会话开始前检查：置位后剩余会话不启动。"""
+        from siwx import exporter
+        n = {"v": 0}
+
+        def fake_run(*a, **k):
+            return {"message_count": 1, "duration_ms": 1}
+
+        def probe():
+            n["v"] += 1
+            return n["v"] > 2                   # 会话 1、2 放行，3 取消
+
+        with mock.patch.object(exporter, "run_export", side_effect=fake_run), \
+             tempfile.TemporaryDirectory() as td:
+            res = exporter.run_export_multi(
+                Path(td), "wxid_test_owner",
+                [{"chat": "a"}, {"chat": "b"}, {"chat": "c"}],
+                fmt="json", progress=lambda p, m: None, should_cancel=probe)
+        self.assertTrue(res["cancelled"])
+        self.assertEqual(res["ok_count"], 2)
+
+    def test_decrypt_serial_cancel(self):
+        """串行媒体解密逐张检查取消探针。"""
+        from siwx import exporter
+        with self.assertRaises(exporter.ExportCancelled):
+            exporter._decrypt_media_serial(
+                Path("acc"), "wxid_test_owner", "wxid_test_peer",
+                [("a" * 32, None, 1, 1, "wxid_test_peer")],
+                Path("dest"), None, should_cancel=lambda: True)
+
+
+class TestMediaBackupCancel(unittest.TestCase):
+    """全量媒体备份的协作式取消：逐文件检查，已完成部分保留。"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="siwx_test_mbcancel_"))
+        self.wxid = "wxid_demo_b"
+        self.account_root = self.tmp / "xwechat_files" / self.wxid
+        (self.account_root / "cache").mkdir(parents=True)
+        attach = self.account_root / "msg" / "attach" / "md5" / "2026-01" / "Img"
+        attach.mkdir(parents=True)
+        (attach / "a.dat").write_bytes(b"x")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _patch_roots(self):
+        return mock.patch("siwx.media._wechat_cache_roots",
+                          return_value=[self.account_root / "cache"])
+
+    def test_backup_images_cancel(self):
+        from siwx import media_backup
+        with self._patch_roots():
+            stats = media_backup.backup_images(
+                self.wxid, self.tmp / "out", log=None,
+                should_cancel=lambda: True)
+        self.assertTrue(stats["cancelled"])
+        self.assertEqual(stats["ok_viewable"], 0)   # 未处理任何文件
+
+    def test_backup_all_propagates_cancel(self):
+        """首段取消后不再进入后续段，顶层报告 cancelled=True。"""
+        from siwx import media_backup
+        with self._patch_roots():
+            report = media_backup.backup_all(
+                self.wxid, self.tmp / "out", log=None,
+                should_cancel=lambda: True)
+        self.assertTrue(report["cancelled"])
+        self.assertTrue(report["images"]["cancelled"])
+        self.assertTrue(report["videos"]["cancelled"])
+        self.assertTrue(report["files"]["cancelled"])
+
+
+class TestChannelsExportEntry(unittest.TestCase):
+    """视频号卡片导出透传（台账 §二-3）：_msg_entry 携带 channels，
+    渲染分支由 renderer.js renderFinder 承担（前端）。"""
+
+    CHANNELS = {"nickname": "合成频道", "desc": "合成描述",
+                "cover": "https://cdn.invalid/c.jpg", "avatar": "",
+                "duration": 75, "mediaCount": 1, "nonce": "nonce_x"}
+
+    def _msg(self):
+        return {"createTime": 1, "senderUsername": "wxid_test_friend",
+                "senderDisplayName": "测试好友", "localType": 49,
+                "content": "[视频号] 合成描述",
+                "rawContent": '<msg><appmsg type="51"></appmsg></msg>',
+                "isSend": 0, "channels": self.CHANNELS}
+
+    def test_msg_entry_carries_channels(self):
+        from siwx.html_template import _msg_entry
+        e = _msg_entry(self._msg())
+        self.assertEqual(e["channels"]["nickname"], "合成频道")
+        self.assertEqual(e["channels"]["duration"], 75)
+
+    def test_msg_entry_without_channels_omits_key(self):
+        from siwx.html_template import _msg_entry
+        m = self._msg()
+        m["channels"] = None
+        self.assertNotIn("channels", _msg_entry(m))
+
+
+class TestConvertDirReport(unittest.TestCase):
+    """方案 A（结果面板一键补生成）：结构化报告 + 取消 + CLI int 契约不变。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name) / "export"
+        sess = self.root / "01_测试会话"
+        sess.mkdir(parents=True)
+        (sess / "测试会话_20261011_120000_000.json").write_text(json.dumps({
+            "session": {"wxid": "wxid_test_friend",
+                        "displayName": "测试会话", "type": "私聊",
+                        "platform": "wechat", "isGroup": False,
+                        "ownerId": "wxid_test_owner",
+                        "firstTimestamp": 1000, "lastTimestamp": 2000,
+                        "messageCount": 1},
+            "messages": [{"localId": 1, "platformMessageId": "1",
+                          "createTime": 1000, "localType": 1,
+                          "typeName": "文本", "rawContent": "你好",
+                          "content": "你好", "isSend": 0,
+                          "senderUsername": "wxid_test_friend",
+                          "senderDisplayName": "测试好友",
+                          "md5": None, "bubbleMd5": None, "voice": None,
+                          "sticker": None, "channels": None, "quote": None,
+                          "link": None, "record": None}],
+        }, ensure_ascii=False), encoding="utf-8")
+        (sess / "manifest.json").write_text(json.dumps({
+            "generator": "stories-in-wx", "written_count": 1,
+            "parse": {}, "media": {},
+        }, ensure_ascii=False), encoding="utf-8")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_report_structured(self):
+        from siwx.json_export_convert import convert_dir_report
+        r = convert_dir_report(self.root, ["md"])
+        self.assertEqual((r["total"], r["ok"], r["failed"], r["skipped"]),
+                         (1, 1, 0, 0))
+        self.assertFalse(r["cancelled"])
+        self.assertTrue((self.root / "01_测试会话"
+                         / "测试会话_20261011_120000_000.md").is_file())
+
+    def test_report_cancelled_gracefully(self):
+        from siwx.json_export_convert import convert_dir_report
+        r = convert_dir_report(self.root, ["md"], overwrite=True,
+                               should_cancel=lambda: True)
+        self.assertTrue(r["cancelled"])
+        self.assertEqual(r["ok"], 0)
+
+    def test_cli_int_contract_unchanged(self):
+        """convert_dir 对 CLI/旧调用方仍返回 int（0=无失败）。"""
+        from siwx.json_export_convert import convert_dir
+        self.assertEqual(convert_dir(self.root, ["md"]), 0)
+
+
+class TestEncryptDatabase(unittest.TestCase):
+    """加密器（decrypt_database 的逆运算）回归。
+
+    写入微信源库的功能依赖"加密产物能被现有解密器读回"，因此这里的守门
+    指标是**往返字节等价**与**页级布局对称**，而不是加密学本身。
+    """
+
+    @staticmethod
+    def _plain(pages=3, tail=0):
+        """构造一份「解密产物形态」的明文：SQLite 头 + 确定性伪随机页内容，
+        每页末 80 字节（reserve 区）为零 —— 与 decrypt_database 的输出一致。"""
+        import hashlib as _h
+        buf = bytearray()
+        buf += b"SQLite format 3\x00"
+        total = pages * 4096
+        while len(buf) < total:
+            buf += _h.sha256(bytes(buf)).digest()
+        buf = buf[:total]
+        buf[20] = 80                    # reserved=80，过 encrypt_database 校验
+        for pg in range(pages):
+            off = pg * 4096
+            if off + 4096 <= len(buf):
+                buf[off + 4016: off + 4096] = b"\x00" * 80
+        if tail:
+            buf += b"\xAB" * tail
+        return bytes(buf)
+
+    def test_round_trip_is_byte_identical(self):
+        from siwx.sqlcipher import decrypt_database, encrypt_database
+        plain = self._plain(3)
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            src, enc, back = td / "p.db", td / "e.db", td / "b.db"
+            src.write_bytes(plain)
+            key = bytes(range(32))
+            salt = bytes(range(16, 32))
+            pages = encrypt_database(src, enc, key, salt=salt)
+            self.assertEqual(pages, 3)
+            decrypt_database(enc, back, key)
+            self.assertEqual(back.read_bytes(), plain)
+
+    def test_hmac_verifies_and_salt_preserved(self):
+        """加密产物必须能通过现有 HMAC 校验，且 salt 原样保留。
+
+        salt 是密钥库的主键（keystore 以 salt_hex 索引密钥）：写回微信源库
+        时 salt 变了，等于给同一个库换了个身份，密钥库与缓存清单全部对不上。
+        """
+        from siwx.sqlcipher import encrypt_database, verify_enc_key
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            src, enc = td / "p.db", td / "e.db"
+            src.write_bytes(self._plain(2))
+            key = bytes(range(32))
+            salt = bytes(range(16, 32))
+            encrypt_database(src, enc, key, salt=salt)
+            raw = enc.read_bytes()
+            self.assertTrue(verify_enc_key(key, raw[:4096]))
+            self.assertEqual(raw[:16], salt)
+
+    def test_layout_is_symmetric_to_decrypt_side(self):
+        """页内布局必须与解密侧严格对称：
+        页 1 = salt(16) + ct(4000) + IV(16) + HMAC(64)
+        其余 = ct(4016) + IV(16) + HMAC(64)
+        """
+        import hashlib as _h
+        import hmac as _hm
+        import struct as _st
+        from siwx.sqlcipher import encrypt_database
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            src, enc = td / "p.db", td / "e.db"
+            src.write_bytes(self._plain(3))
+            key = bytes(range(32))
+            salt = bytes(range(16, 32))
+            encrypt_database(src, enc, key, salt=salt)
+            raw = enc.read_bytes()
+            self.assertEqual(len(raw), 3 * 4096)
+            # 页 1：IV 在 4016，HMAC 在 4032
+            self.assertEqual(len(raw[16:4016]), 4000)
+            self.assertEqual(len(raw[4016:4032]), 16)
+            self.assertEqual(len(raw[4032:4096]), 64)
+            # 页 2：密文区从 0 开始
+            self.assertEqual(len(raw[4096:4096 + 4016]), 4016)
+            # HMAC 覆盖「密文 + IV」，末尾追加小端页号（实测确认的口径）
+            mac_salt = bytes(b ^ 0x3A for b in salt)
+            mac_key = _h.pbkdf2_hmac("sha512", key, mac_salt, 2, dklen=32)
+            pg2 = raw[4096:8192]
+            hm = _hm.new(mac_key, pg2[:4032], _h.sha512)
+            hm.update(_st.pack("<I", 2))
+            self.assertTrue(_hm.compare_digest(hm.digest(), pg2[4032:4096]))
+
+    def test_partial_tail_page_is_padded(self):
+        """末页不足一页时按整页补零（与解密侧行为对称）。"""
+        from siwx.sqlcipher import decrypt_database, encrypt_database
+        plain = self._plain(2, tail=100)
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            src, enc, back = td / "p.db", td / "e.db", td / "b.db"
+            src.write_bytes(plain)
+            key = bytes(range(32))
+            pages = encrypt_database(src, enc, key, salt=bytes(range(16)))
+            self.assertEqual(pages, 3)
+            decrypt_database(enc, back, key)
+            got = back.read_bytes()
+            self.assertEqual(got[:len(plain)], plain)
+            self.assertEqual(got[len(plain):], b"\x00" * (4096 - 100))
+
+    def test_rejects_non_sqlite_plaintext(self):
+        from siwx.sqlcipher import encrypt_database
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            src = td / "x.bin"
+            src.write_bytes(b"NOT-A-SQLITE" + b"\x00" * 5000)
+            with self.assertRaises(ValueError):
+                encrypt_database(src, td / "e.db", bytes(range(32)))
+
+    def test_rejects_wrong_key_length(self):
+        from siwx.sqlcipher import encrypt_database
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            src = td / "p.db"
+            src.write_bytes(self._plain(1))
+            with self.assertRaises(ValueError):
+                encrypt_database(src, td / "e.db", b"short-key")
+
+
+class TestSiwxPack(unittest.TestCase):
+    """SIWXPAK1 加密备份容器：往返/错密码/截断/篡改/路径白名单。"""
+
+    PW = "correct horse battery staple"
+
+    @staticmethod
+    def _mkfile(p: Path, size: int, seed=b"x") -> Path:
+        import hashlib as _h
+        buf = bytearray()
+        while len(buf) < size:
+            buf += _h.sha256(seed + bytes([len(buf) % 251])).digest()
+        p.write_bytes(bytes(buf[:size]))
+        return p
+
+    def test_round_trip_multi_frame(self):
+        from siwx.pack import read_pack, write_pack
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            f1 = self._mkfile(td / "a.db", 5 * 1024 * 1024 + 7)   # 跨多帧+尾帧
+            f2 = self._mkfile(td / "b.json", 300, seed=b"y")
+            rep = write_pack(td / "p.siwxpack", self.PW,
+                             [("message/a.db", f1), ("meta/b.json", f2)],
+                             {"mode": "test", "account": "wxid_test_pack"})
+            self.assertEqual(rep["files"], 2)
+            self.assertEqual(rep["payload_len"], f1.stat().st_size + f2.stat().st_size)
+            out = td / "out"
+            manifest = read_pack(td / "p.siwxpack", self.PW, out)
+            self.assertEqual(manifest["account"], "wxid_test_pack")
+            self.assertEqual((out / "message" / "a.db").read_bytes(), f1.read_bytes())
+            self.assertEqual((out / "meta" / "b.json").read_bytes(), f2.read_bytes())
+
+    def test_wrong_password_rejected_cleanly(self):
+        from siwx.pack import PackPasswordError, read_pack, write_pack
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            f = self._mkfile(td / "a.db", 100)
+            write_pack(td / "p.siwxpack", self.PW, [("a.db", f)], {})
+            with self.assertRaises(PackPasswordError):
+                read_pack(td / "p.siwxpack", "wrong password!", td / "out")
+
+    def test_short_password_rejected(self):
+        from siwx.pack import PackError, write_pack
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            f = self._mkfile(td / "a.db", 10)
+            with self.assertRaises(PackError):
+                write_pack(td / "p.siwxpack", "short", [("a.db", f)], {})
+
+    def test_truncated_pack_fails(self):
+        from siwx.pack import PackError, read_pack, write_pack
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            f = self._mkfile(td / "a.db", 10 * 1024 * 1024)
+            pack = td / "p.siwxpack"
+            write_pack(pack, self.PW, [("a.db", f)], {})
+            raw = pack.read_bytes()
+            pack.write_bytes(raw[:-20])       # 尾部截断
+            with self.assertRaises(PackError):
+                read_pack(pack, self.PW, td / "out")
+
+    def test_tampered_frame_fails(self):
+        from siwx.pack import PackError, read_pack, write_pack
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            f = self._mkfile(td / "a.db", 4096)
+            pack = td / "p.siwxpack"
+            write_pack(pack, self.PW, [("a.db", f)], {})
+            raw = bytearray(pack.read_bytes())
+            # 定位第一帧：magic(8) + ver/hlen(6) + header + iv(12) + mlen(4) + manifest
+            import struct as _st
+            hlen = _st.unpack("<I", bytes(raw[10:14]))[0]
+            off = 8 + 6 + hlen
+            (mlen,) = _st.unpack("<I", bytes(raw[off + 12:off + 16]))
+            frame_start = off + 12 + 4 + mlen
+            self.assertLess(frame_start + 30, len(raw))
+            raw[frame_start + 30] ^= 0xFF       # 篡改第一帧密文
+            pack.write_bytes(bytes(raw))
+            with self.assertRaises(PackError):
+                read_pack(pack, self.PW, td / "out")
+
+    def test_traversal_rel_rejected(self):
+        from siwx.pack import PackError, write_pack
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            f = self._mkfile(td / "a.db", 10)
+            with self.assertRaises(PackError):
+                write_pack(td / "p.siwxpack", self.PW,
+                           [("../evil", f)], {})
+
+    def test_peek_pack_needs_no_password(self):
+        from siwx.pack import peek_pack, write_pack
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            f = self._mkfile(td / "a.db", 10)
+            write_pack(td / "p.siwxpack", self.PW, [("a.db", f)], {})
+            info = peek_pack(td / "p.siwxpack")
+            self.assertEqual(info["format"], 1)
+            self.assertEqual(info["kdf"]["alg"], "scrypt")
+
+
+MSG_DDL = (
+    "CREATE TABLE Msg_{tag}(local_id INTEGER PRIMARY KEY AUTOINCREMENT, "
+    "server_id INTEGER, local_type INTEGER, sort_seq INTEGER, "
+    "real_sender_id INTEGER, create_time INTEGER, status INTEGER, "
+    "upload_status INTEGER, download_status INTEGER, server_seq INTEGER, "
+    "origin_source INTEGER, source TEXT, message_content TEXT, "
+    "compress_content TEXT, packed_info_data BLOB, "
+    "WCDB_CT_message_content INTEGER DEFAULT NULL, "
+    "WCDB_CT_source INTEGER DEFAULT NULL)"
+)
+
+
+class TestBackupSelective(unittest.TestCase):
+    """选择性载荷构建：过滤 + Name2Id 重映射 + session/contact 合成。"""
+
+    CHAT_A = "wxid_test_aaa111"
+    CHAT_B = "wxid_test_bbb222"
+
+    def _fixture(self, td: Path):
+        import hashlib as _h
+        shard = td / "message_0.db"
+        c = sqlite3.connect(str(shard))
+        c.execute("CREATE TABLE Name2Id(user_name TEXT, is_session INTEGER)")
+        c.execute("INSERT INTO Name2Id VALUES(?, 1)", (self.CHAT_A,))
+        c.execute("INSERT INTO Name2Id VALUES(?, 1)", (self.CHAT_B,))
+        c.execute("INSERT INTO Name2Id VALUES(?, 0)", ("wxid_test_sender",))
+        ta = "Msg_" + _h.md5(self.CHAT_A.encode()).hexdigest()
+        tb = "Msg_" + _h.md5(self.CHAT_B.encode()).hexdigest()
+        c.execute(MSG_DDL.format(tag=_h.md5(self.CHAT_A.encode()).hexdigest()))
+        c.execute(MSG_DDL.format(tag=_h.md5(self.CHAT_B.encode()).hexdigest()))
+        base = 1900000000
+        rows = [
+            # (tbl, local_id, server_id, type, sender_rowid, ctime, 内容)
+            (ta, 1, 101, 1, 3, base, "in-text"),        # 保留：文本+窗内
+            (ta, 2, 102, 1, 1, base + 10, "out-text"),  # 保留
+            (ta, 3, 103, 3, 1, base + 20, "<img>"),     # 过滤：类别 3
+            (ta, 4, 104, 1, 1, base - 999999, "old"),   # 过滤：窗外
+            (tb, 1, 201, 1, 1, base + 5, "b-text"),     # 过滤：未勾选 B
+        ]
+        for tbl, lid, sid, t, sender, ctime, content in rows:
+            c.execute(
+                f"INSERT INTO [{tbl}] (local_id, server_id, local_type, sort_seq, "
+                "real_sender_id, create_time, status, upload_status, "
+                "download_status, server_seq, origin_source, source, "
+                "message_content, compress_content, packed_info_data) "
+                "VALUES(?,?,?,?,?,?,3,0,0,?,2,'src',?, '', NULL)",
+                (lid, sid, t, ctime * 1000, sender, ctime, sid * 10, content))
+        c.commit()
+        c.close()
+
+        sess = td / "session.db"
+        c = sqlite3.connect(str(sess))
+        c.execute("CREATE TABLE SessionTable(username TEXT, summary TEXT, "
+                  "last_timestamp INTEGER)")
+        c.execute("CREATE TABLE Name2Id(user_name TEXT)")
+        c.execute("INSERT INTO SessionTable VALUES(?,?,?)",
+                  (self.CHAT_A, "sa", base + 10))
+        c.execute("INSERT INTO SessionTable VALUES(?,?,?)",
+                  (self.CHAT_B, "sb", base + 5))
+        c.execute("INSERT INTO Name2Id VALUES(?)", (self.CHAT_A,))
+        c.commit()
+        c.close()
+
+        contact = td / "contact.db"
+        c = sqlite3.connect(str(contact))
+        c.execute("CREATE TABLE contact(id INTEGER PRIMARY KEY, username TEXT, "
+                  "nick_name TEXT)")
+        c.execute("CREATE TABLE name2id(username TEXT)")
+        c.execute("INSERT INTO contact VALUES(1, ?, 'A')", (self.CHAT_A,))
+        c.execute("INSERT INTO contact VALUES(2, ?, 'B')", (self.CHAT_B,))
+        c.execute("INSERT INTO name2id VALUES(?)", (self.CHAT_A,))
+        c.commit()
+        c.close()
+        return shard, sess, contact
+
+    def test_selective_filters_and_remaps(self):
+        from siwx.backup import build_selective_plain, msg_table_of
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            shard, sess, contact = self._fixture(td)
+            built = build_selective_plain(
+                [shard], sess, contact,
+                chats=[self.CHAT_A], types=[1],
+                start=1900000000 - 100, end=1900000000 + 100,
+                payload_dir=td / "payload", log=lambda *_a: None)
+            st = built["stats"]
+            self.assertEqual(st["chats_count"], 1)
+            self.assertEqual(st["chats"][self.CHAT_A], 2)
+            self.assertEqual(st["messages"], 2)
+
+            om = sqlite3.connect(str(td / "payload" / "message" / "message_0.db"))
+            try:
+                ta = msg_table_of(self.CHAT_A)
+                tb = msg_table_of(self.CHAT_B)
+                have = {r[0] for r in om.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'")}
+                self.assertIn(ta, have)
+                self.assertNotIn(tb, have)
+                rows = om.execute(
+                    f"SELECT local_id, server_id, real_sender_id, message_content "
+                    f"FROM [{ta}] ORDER BY local_id").fetchall()
+                self.assertEqual([r[3] for r in rows], ["in-text", "out-text"])
+                self.assertEqual([r[0] for r in rows], [1, 2])
+                # sender 重映射：新 rowid → username 必须对得上原发送者
+                n2i = {rid: u for rid, u in om.execute(
+                    "SELECT rowid, user_name FROM Name2Id")}
+                src_sender = {1: self.CHAT_A, 3: "wxid_test_sender"}
+                for row in om.execute(f"SELECT real_sender_id FROM [{ta}]"):
+                    pass
+                senders = {r[0] for r in om.execute(
+                    f"SELECT real_sender_id FROM [{ta}]")}
+                mapped = {n2i.get(s) for s in senders}
+                self.assertEqual(mapped, {self.CHAT_A, "wxid_test_sender"})
+                seq = om.execute("SELECT seq FROM sqlite_sequence WHERE name=?",
+                                 (ta,)).fetchone()
+                self.assertEqual(seq[0], 2)
+            finally:
+                om.close()
+
+            oss = sqlite3.connect(str(td / "payload" / "session" / "session.db"))
+            try:
+                users = {r[0] for r in oss.execute(
+                    "SELECT username FROM SessionTable")}
+                self.assertEqual(users, {self.CHAT_A})
+            finally:
+                oss.close()
+
+            oc = sqlite3.connect(str(td / "payload" / "contact" / "contact.db"))
+            try:
+                nicks = {r[0] for r in oc.execute(
+                    "SELECT nick_name FROM contact")}
+                self.assertEqual(nicks, {"A"})
+            finally:
+                oc.close()
+
+    def test_selective_all_chats(self):
+        from siwx.backup import build_selective_plain
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            shard, sess, contact = self._fixture(td)
+            built = build_selective_plain(
+                [shard], sess, contact, chats=None,
+                payload_dir=td / "payload", log=lambda *_a: None)
+            self.assertEqual(built["stats"]["chats_count"], 2)
+            self.assertEqual(built["stats"]["messages"], 5)
+
+    def _fixture_zero_sid(self, td: Path):
+        """同会话多条 server_id=0/NULL + 若干 >0 的源分片（全部合成占位）。"""
+        import hashlib as _h
+        shard = td / "message_0.db"
+        c = sqlite3.connect(str(shard))
+        c.execute("CREATE TABLE Name2Id(user_name TEXT, is_session INTEGER)")
+        c.execute("INSERT INTO Name2Id VALUES(?, 1)", (self.CHAT_A,))
+        ta = "Msg_" + _h.md5(self.CHAT_A.encode()).hexdigest()
+        c.execute(MSG_DDL.format(tag=_h.md5(self.CHAT_A.encode()).hexdigest()))
+        base = 1900000000
+        # (server_id, ctime, 内容)——0 值行 ctime/sort_seq 各不相同
+        rows = [
+            (0, base, "sys-zero-1"),
+            (0, base + 1, "sys-zero-2"),
+            (0, base + 2, "sys-zero-3"),
+            (None, base + 3, "sys-null"),
+            (101, base + 4, "synced-a"),
+            (102, base + 5, "synced-b"),
+        ]
+        for i, (sid, ctime, content) in enumerate(rows, start=1):
+            c.execute(
+                f"INSERT INTO [{ta}] (local_id, server_id, local_type, "
+                "sort_seq, real_sender_id, create_time, status, "
+                "upload_status, download_status, server_seq, origin_source, "
+                "source, message_content, compress_content, packed_info_data) "
+                "VALUES(?,?,1,?,1,?,3,0,0,?,2,'s',?,'',NULL)",
+                (i, sid, ctime * 1000, ctime, sid * 10 if sid else 0, content))
+        c.commit()
+        c.close()
+
+        sess = td / "session.db"
+        c = sqlite3.connect(str(sess))
+        c.execute("CREATE TABLE SessionTable(username TEXT, summary TEXT, "
+                  "last_timestamp INTEGER)")
+        c.execute("CREATE TABLE Name2Id(user_name TEXT)")
+        c.execute("INSERT INTO SessionTable VALUES(?,?,?)",
+                  (self.CHAT_A, "sa", base + 5))
+        c.execute("INSERT INTO Name2Id VALUES(?)", (self.CHAT_A,))
+        c.commit()
+        c.close()
+
+        contact = td / "contact.db"
+        c = sqlite3.connect(str(contact))
+        c.execute("CREATE TABLE contact(id INTEGER PRIMARY KEY, username TEXT, "
+                  "nick_name TEXT)")
+        c.execute("CREATE TABLE name2id(username TEXT)")
+        c.execute("INSERT INTO contact VALUES(1, ?, 'A')", (self.CHAT_A,))
+        c.execute("INSERT INTO name2id VALUES(?)", (self.CHAT_A,))
+        c.commit()
+        c.close()
+        return shard, sess, contact, ta
+
+    def test_selective_keeps_server_id_zero_rows(self):
+        """[P1-2 回归] server_id=0/NULL 的消息在选择性备份中不得按裸
+        server_id 去重塌缩：同会话 3 条 0 值 + 1 条 NULL + 2 条 >0 全保留。"""
+        from siwx.backup import build_selective_plain, msg_table_of
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            shard, sess, contact, _ta = self._fixture_zero_sid(td)
+            built = build_selective_plain(
+                [shard], sess, contact, chats=[self.CHAT_A],
+                payload_dir=td / "payload", log=lambda *_a: None)
+            st = built["stats"]
+            self.assertEqual(st["messages"], 6)
+            self.assertEqual(st["chats"][self.CHAT_A], 6)
+            self.assertNotIn("dup_skipped", st)
+
+            om = sqlite3.connect(str(td / "payload" / "message" /
+                                     "message_0.db"))
+            try:
+                ta = msg_table_of(self.CHAT_A)
+                rows = om.execute(
+                    f"SELECT server_id, message_content FROM [{ta}] "
+                    f"ORDER BY sort_seq").fetchall()
+                self.assertEqual([r[1] for r in rows],
+                                 ["sys-zero-1", "sys-zero-2", "sys-zero-3",
+                                  "sys-null", "synced-a", "synced-b"])
+                zero = sum(1 for r in rows if r[0] == 0)
+                null = sum(1 for r in rows if r[0] is None)
+                self.assertEqual((zero, null), (3, 1))
+            finally:
+                om.close()
+
+
+class TestBackupApi(unittest.TestCase):
+    """/api/backup/*：两段式杀进程确认 + 参数校验 + 任务槽。"""
+
+    @staticmethod
+    def _client():
+        from siwx import server
+        return server.app.test_client()
+
+    def _wait_done(self, client, timeout=60):
+        for _ in range(int(timeout / 0.05)):
+            st = client.get("/api/backup/status").get_json()
+            if st["done"]:
+                return st
+            time.sleep(0.05)
+        return client.get("/api/backup/status").get_json()
+
+    def test_wechat_state_shape(self):
+        r = self._client().get("/api/backup/wechat")
+        self.assertEqual(r.status_code, 200)
+        j = r.get_json()
+        self.assertIn("running", j)
+        self.assertIsInstance(j["pids"], list)
+
+    def test_start_validates_password_types_time(self):
+        c = self._client()
+        ok = {"mode": "full", "password": "long-enough-pw"}
+        r = c.post("/api/backup/start", json={**ok, "password": "short"})
+        self.assertEqual(r.status_code, 400)
+        r = c.post("/api/backup/start", json={**ok, "types": ["a"]})
+        self.assertEqual(r.status_code, 400)
+        r = c.post("/api/backup/start", json={**ok, "start": "not-a-date"})
+        self.assertEqual(r.status_code, 400)
+        r = c.post("/api/backup/start", json={**ok, "chats": [123]})
+        self.assertEqual(r.status_code, 400)
+
+    def test_need_kill_two_phase_then_run(self):
+        """微信在跑：不带 allowKill 只报状态不启动；带 allowKill 才真正跑。"""
+        c = self._client()
+        fake = {"path": "x.siwxpack", "size": 123, "files": 2,
+                "mode": "full", "stats": {}, "wal": []}
+        with mock.patch("siwx.discover.find_wechat_pids", return_value=[4321]), \
+                mock.patch("siwx.backup.run_backup", return_value=fake) as rb:
+            r = c.post("/api/backup/start",
+                       json={"mode": "full", "password": "long-enough-pw"})
+            j = r.get_json()
+            self.assertTrue(j.get("needKill"))
+            self.assertEqual(j["pids"], [4321])
+            # 未获允许：任务不应启动
+            st = c.get("/api/backup/status").get_json()
+            self.assertFalse(st["running"])
+
+            r2 = c.post("/api/backup/start",
+                        json={"mode": "full", "password": "long-enough-pw",
+                              "allowKill": True})
+            self.assertTrue(r2.get_json().get("started"))
+            st = self._wait_done(c)
+            self.assertTrue(st["ok"], st.get("error"))
+            self.assertEqual(st["result"]["files"], 2)
+            rb.assert_called_once()
+            # 密码绝不能进任务状态/日志
+            self.assertNotIn("long-enough-pw", json.dumps(st))
+        # 复位任务槽，避免影响后续测试
+        from siwx.api_backup import _job
+        _job.update({"running": False, "done": False, "ok": False,
+                     "progress": 0, "msg": "", "logs": [], "result": None,
+                     "error": None})
+
+    def test_peek_rejects_outside_exports(self):
+        c = self._client()
+        r = c.post("/api/backup/peek", json={"path": "../../etc/passwd"})
+        self.assertEqual(r.status_code, 404)
+
+
+class TestRestoreEngine(unittest.TestCase):
+    """恢复引擎：analyze 只读 diff / apply 合入专用恢复分片 / 幂等 / 全新安装。"""
+
+    PW = "restore-test-pass"
+    ACC = "wxid_test_acc"
+
+    def _mk_target(self, out_root: Path):
+        """目标缓存库：账号目录里已有 chat A 的 2 条消息（sid 101,102）。"""
+        import hashlib as _h
+        acc = out_root / self.ACC
+        (acc / "message").mkdir(parents=True, exist_ok=True)
+        (acc / "session").mkdir(parents=True, exist_ok=True)
+        (acc / "contact").mkdir(parents=True, exist_ok=True)
+        ta = "Msg_" + _h.md5(TestBackupSelective.CHAT_A.encode()).hexdigest()
+        m = acc / "message" / "message_0.db"
+        c = sqlite3.connect(str(m))
+        c.execute("CREATE TABLE Name2Id(user_name TEXT, is_session INTEGER)")
+        c.execute("INSERT INTO Name2Id VALUES(?, 1)", (TestBackupSelective.CHAT_A,))
+        c.execute(MSG_DDL.format(tag=_h.md5(TestBackupSelective.CHAT_A.encode()).hexdigest()))
+        base = 1900000000
+        for i, sid in enumerate((101, 102), start=1):
+            c.execute(
+                f"INSERT INTO [{ta}] (local_id, server_id, local_type, sort_seq, "
+                "real_sender_id, create_time, status, server_seq, origin_source, "
+                "source, message_content) VALUES(?,?,1,?,1,?,3,?,2,'s',?)",
+                (i, sid, (base + i) * 1000, base + i, sid * 10, f"target-{sid}"))
+        c.commit()
+        c.close()
+        s = acc / "session" / "session.db"
+        c = sqlite3.connect(str(s))
+        c.execute("CREATE TABLE SessionTable(username TEXT, summary TEXT, "
+                  "last_timestamp INTEGER)")
+        c.execute("CREATE TABLE Name2Id(user_name TEXT)")
+        c.execute("INSERT INTO SessionTable VALUES(?,?,?)",
+                  (TestBackupSelective.CHAT_A, "old", base))
+        c.execute("INSERT INTO Name2Id VALUES(?)", (TestBackupSelective.CHAT_A,))
+        c.commit()
+        c.close()
+        ct = acc / "contact" / "contact.db"
+        c = sqlite3.connect(str(ct))
+        c.execute("CREATE TABLE contact(id INTEGER PRIMARY KEY, username TEXT, "
+                  "nick_name TEXT)")
+        c.execute("CREATE TABLE name2id(username TEXT)")
+        c.execute("INSERT INTO contact VALUES(1, ?, 'A-old')",
+                  (TestBackupSelective.CHAT_A,))
+        c.execute("INSERT INTO name2id VALUES(?)", (TestBackupSelective.CHAT_A,))
+        c.commit()
+        c.close()
+        return acc
+
+    def _mk_pack(self, td: Path) -> Path:
+        """用 build_selective_plain 造一个含 chat A 全部 4 条消息的真包。"""
+        from siwx.backup import build_selective_plain
+        from siwx.pack import write_pack
+        (td / "src").mkdir(parents=True, exist_ok=True)
+        shard, sess, contact = TestBackupSelective()._fixture(td / "src")
+        built = build_selective_plain(
+            [shard], sess, contact, chats=[TestBackupSelective.CHAT_A],
+            payload_dir=td / "payload", log=lambda *_a: None)
+        pack = td / "p.siwxpack"
+        write_pack(pack, self.PW, built["files"],
+                   {"mode": "selective", "account": self.ACC,
+                    "created_at": "2026-10-24T12:00:00", "selection": {}})
+        return pack
+
+    def _stage(self, td, out_root):
+        from siwx import restore as _restore
+        pack = self._mk_pack(td / "mk")
+        self._mk_target(out_root)
+        return _restore.stage_pack(pack, self.PW, stage_root=td / "stages")
+
+    def test_analyze_diff_counts(self):
+        from siwx import restore as _restore
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            stage = self._stage(td, td / "out")
+            rep = _restore.analyze(stage, out_root=td / "out")
+            self.assertFalse(rep["fresh"])
+            self.assertEqual(rep["total_pack"], 4)      # 包内 4 条
+            self.assertEqual(rep["total_dup"], 2)       # 101,102 已存在
+            self.assertEqual(rep["total_insert"], 2)    # 103,104 将恢复
+            chat = next(c for c in rep["chats"]
+                        if c["username"] == TestBackupSelective.CHAT_A)
+            self.assertEqual(chat["to_insert"], 2)
+            self.assertEqual(chat["display"], "A")      # 包 contact 优先于目标
+            # analyze 是只读的：目标库行数不变
+            import hashlib as _h2
+            m = td / "out" / self.ACC / "message" / "message_0.db"
+            c = sqlite3.connect(str(m))
+            n = c.execute("SELECT COUNT(*) FROM Msg_"
+                          + _h2.md5(
+                              TestBackupSelective.CHAT_A.encode()).hexdigest()
+                          ).fetchone()[0]
+            c.close()
+            self.assertEqual(n, 2)
+
+    def test_apply_then_idempotent(self):
+        from siwx import restore as _restore
+        import hashlib as _h
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            stage = self._stage(td, td / "out")
+            res = _restore.apply(stage, out_root=td / "out",
+                                 log=lambda *_a: None)
+            self.assertEqual(res["mode"], "merge")
+            self.assertEqual(res["inserted"], 2)
+            self.assertEqual(res["dup"], 2)
+            rshard = td / "out" / self.ACC / "message" / "message_restore_0.db"
+            self.assertTrue(rshard.is_file())
+            c = sqlite3.connect(str(rshard))
+            ta = "Msg_" + _h.md5(TestBackupSelective.CHAT_A.encode()).hexdigest()
+            sids = {r[0] for r in c.execute(
+                f"SELECT server_id FROM [{ta}]")}
+            self.assertEqual(sids, {103, 104})
+            mx = c.execute(f"SELECT MAX(local_id) FROM [{ta}]").fetchone()[0]
+            cnt = c.execute(f"SELECT COUNT(*) FROM [{ta}]").fetchone()[0]
+            seq = c.execute("SELECT seq FROM sqlite_sequence WHERE name=?",
+                            (ta,)).fetchone()
+            self.assertEqual((mx, cnt, seq[0]), (2, 2, 2))
+            c.close()
+            # session 行被包内较新版本覆盖
+            s = sqlite3.connect(str(td / "out" / self.ACC / "session" / "session.db"))
+            self.assertEqual(
+                s.execute("SELECT summary FROM SessionTable WHERE username=?",
+                          (TestBackupSelective.CHAT_A,)).fetchone()[0], "sa")
+            s.close()
+
+            # 幂等：同包再 stage+analyze → 0 条将恢复
+            stage2 = _restore.stage_pack(td / "mk" / "p.siwxpack", self.PW,
+                                         stage_root=td / "stages")
+            rep2 = _restore.analyze(stage2, out_root=td / "out")
+            self.assertEqual(rep2["total_insert"], 0)
+            self.assertEqual(rep2["total_dup"], 4)
+
+    def test_fresh_install(self):
+        from siwx import restore as _restore
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            pack = self._mk_pack(td / "mk")
+            stage = _restore.stage_pack(pack, self.PW, stage_root=td / "stages")
+            rep = _restore.analyze(stage, out_root=td / "empty_out")
+            self.assertTrue(rep["fresh"])
+            res = _restore.apply(stage, out_root=td / "empty_out",
+                                 log=lambda *_a: None)
+            self.assertEqual(res["mode"], "install")
+            self.assertEqual(res["files"], 3)   # message/session/contact
+            self.assertTrue((td / "empty_out" / self.ACC /
+                             "message" / "message_0.db").is_file())
+
+    def _mk_pack_zero(self, td: Path) -> Path:
+        """用 _fixture_zero_sid 造一个含 chat A 的 server_id 0/NULL 多条
+        + >0 若干消息的真包（全部合成占位）。"""
+        from siwx.backup import build_selective_plain
+        from siwx.pack import write_pack
+        (td / "src").mkdir(parents=True, exist_ok=True)
+        shard, sess, contact, _ta = \
+            TestBackupSelective()._fixture_zero_sid(td / "src")
+        built = build_selective_plain(
+            [shard], sess, contact, chats=[TestBackupSelective.CHAT_A],
+            payload_dir=td / "payload", log=lambda *_a: None)
+        pack = td / "p.siwxpack"
+        write_pack(pack, self.PW, built["files"],
+                   {"mode": "selective", "account": self.ACC,
+                    "created_at": "2026-10-24T12:00:00", "selection": {}})
+        return pack
+
+    def test_apply_keeps_server_id_zero_rows(self):
+        """[P1-2 回归] 恢复 apply 路径：server_id=0/NULL 多条全部落库，
+        不按裸 server_id 去重跳过；对账口径一致（0/NULL 行算待插入）。"""
+        import hashlib as _h
+        from siwx import restore as _restore
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            pack = self._mk_pack_zero(td / "mk")
+            self._mk_target(td / "out")     # 目标已有 sid 101,102
+            stage = _restore.stage_pack(pack, self.PW,
+                                         stage_root=td / "stages")
+            rep = _restore.analyze(stage, out_root=td / "out")
+            self.assertEqual(rep["total_pack"], 6)      # 0/NULL 行逐行计数
+            self.assertEqual(rep["total_dup"], 2)       # 101,102 已存在
+            self.assertEqual(rep["total_insert"], 4)    # 3 条 0 值 + 1 条 NULL
+            res = _restore.apply(stage, out_root=td / "out",
+                                 log=lambda *_a: None)
+            self.assertEqual(res["inserted"], 4)
+            self.assertEqual(res["dup"], 2)
+            rshard = td / "out" / self.ACC / "message" / "message_restore_0.db"
+            self.assertTrue(rshard.is_file())
+            c = sqlite3.connect(str(rshard))
+            ta = "Msg_" + _h.md5(
+                TestBackupSelective.CHAT_A.encode()).hexdigest()
+            rows = c.execute(
+                f"SELECT server_id, message_content FROM [{ta}] "
+                f"ORDER BY sort_seq").fetchall()
+            c.close()
+            self.assertEqual([r[1] for r in rows],
+                             ["sys-zero-1", "sys-zero-2", "sys-zero-3",
+                              "sys-null"])
+            self.assertEqual(sum(1 for r in rows if r[0] == 0), 3)
+            self.assertEqual(sum(1 for r in rows if r[0] is None), 1)
+
+    def test_load_stage_rejects_bad_stage_id(self):
+        """[P1-5 回归] stage_id 是请求体原样透传值，必须白名单钉死为
+        12 位小写 hex——否则 `../..` 可指向暂存根之外的任意目录。"""
+        from siwx import restore as _restore
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            stage_root = td / "stages"
+            stage_root.mkdir()
+            # 合法形态：stage_pack 产物（uuid4().hex[:12]）能原样 load 回来
+            pack = self._mk_pack(td / "mk")
+            ok = _restore.stage_pack(pack, self.PW, stage_root=stage_root)
+            self.assertRegex(ok["id"], r"^[0-9a-f]{12}$")
+            loaded = _restore.load_stage(ok["id"], stage_root=stage_root)
+            self.assertEqual(loaded["id"], ok["id"])
+            # 合法 12 位小写 hex（手工造的 stage）也放行
+            fake = stage_root / "0123456789ab"
+            fake.mkdir()
+            (fake / "manifest.json").write_text("{}", encoding="utf-8")
+            self.assertEqual(
+                _restore.load_stage("0123456789ab",
+                                    stage_root=stage_root)["id"],
+                "0123456789ab")
+            # 非法形态一律拒绝（异常类型与现有校验一致 → RestoreError）
+            for bad in ("../..", "..%2f..", "", "abc",
+                        "0123456789abc",          # 13 位
+                        "0123456789AB",           # 大写
+                        "zzzzzzzzzzzz",           # 非 hex
+                        "0123456789a/", "0123-4567-89", "../../etc",
+                        None, 123):
+                with self.assertRaises(_restore.RestoreError):
+                    _restore.load_stage(bad, stage_root=stage_root)
+
+    def test_apply_rejects_manifest_account_traversal(self):
+        """[P1-6 回归] manifest account 制包者可控：`../..` 必须被拒，
+        且不在 out_root 之外写出任何文件；正常 account 的全新安装不受影响。"""
+        from siwx import restore as _restore
+        from siwx.pack import write_pack
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            src = td / "src"
+            src.mkdir()
+            c = sqlite3.connect(str(src / "message_0.db"))
+            c.execute("CREATE TABLE Name2Id(user_name TEXT, is_session INTEGER)")
+            c.commit()
+            c.close()
+            pack = td / "p.siwxpack"
+            write_pack(pack, self.PW,
+                       [("message/message_0.db", src / "message_0.db")],
+                       {"mode": "selective", "account": "../..",
+                        "created_at": "2026-10-24T12:00:00", "selection": {}})
+            stage = _restore.stage_pack(pack, self.PW, stage_root=td / "stages")
+            # out_root 放深两层：若校验失效，`../..` 会落到 td/"a"，
+            # 断言它只包含预期子树即可证明没有越界写出
+            out_root = td / "a" / "b" / "out"
+            out_root.mkdir(parents=True)
+            with self.assertRaises(_restore.RestoreError):
+                _restore.apply(stage, out_root=out_root,
+                               log=lambda *_a: None)
+            self.assertEqual(list(out_root.rglob("*")), [])
+            if (td / "a").exists():
+                self.assertEqual(sorted(p.name for p in (td / "a").iterdir()),
+                                 ["b"])
+                self.assertEqual(sorted(p.name
+                                        for p in (td / "a" / "b").iterdir()),
+                                 ["out"])
+
+    def test_apply_rejects_payload_rel_escape(self):
+        """[P1-6 回归] account 合法但包内 rel 越界（`../evil.db`）：全新安装
+        写文件前逐项断言落点在账号目录内，越界即整体失败。"""
+        from siwx import restore as _restore
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            pack = self._mk_pack(td / "mk")
+            stage = _restore.stage_pack(pack, self.PW, stage_root=td / "stages")
+            # 篡改暂存 manifest 注入越界 rel，并在 payload 旁放好源文件
+            (stage["dir"] / "evil.db").write_bytes(b"evil")
+            mf = dict(stage["manifest"])
+            mf["files"] = [{"rel": "../evil.db"}]
+            (stage["dir"] / "manifest.json").write_text(
+                json.dumps(mf, ensure_ascii=False), encoding="utf-8")
+            stage["manifest"] = mf
+            out_root = td / "a" / "b" / "out"
+            out_root.mkdir(parents=True)
+            with self.assertRaises(_restore.RestoreError):
+                _restore.apply(stage, out_root=out_root,
+                               log=lambda *_a: None)
+            # 没有写出任何文件（全新安装会先建账号目录，但失败时它必须为空，
+            # 且 evil.db 不得落到账号目录之外）
+            self.assertFalse(any(p.is_file() for p in out_root.rglob("*")))
+            self.assertFalse((out_root / "evil.db").exists())
+            self.assertFalse((out_root.parent / "evil.db").exists())
+            self.assertFalse((out_root.parent.parent / "evil.db").exists())
+
+    def test_api_analyze_wrong_password(self):
+        from siwx import server
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            exports = td / "exports"
+            exports.mkdir()
+            shutil.copy2(self._mk_pack(td / "mk"), exports / "p.siwxpack")
+            client = server.app.test_client()
+            with mock.patch("siwx.api_backup._paths.exports_root",
+                            side_effect=lambda: exports), \
+                 mock.patch("siwx.restore._paths.data_dir",
+                            side_effect=lambda: td / "data"):
+                r = client.post("/api/backup/restore/analyze",
+                                json={"path": str(exports / "p.siwxpack"),
+                                      "password": "wrong-password"})
+                self.assertEqual(r.status_code, 400)
+                r2 = client.post("/api/backup/restore/analyze",
+                                 json={"path": str(exports / "p.siwxpack"),
+                                       "password": self.PW})
+                self.assertEqual(r2.status_code, 200)
+                self.assertIn("stage_id", r2.get_json())
+
+
+class TestRestoreWechat(unittest.TestCase):
+    """恢复到微信源库：analyze_wechat diff / apply_wechat 合并 / 勾选过滤 / 幂等。
+
+    用 encrypt_database 构造假的微信 db_storage（真 SQLCipher 格式），并 mock
+    账号发现——不依赖真实微信环境。"""
+
+    PW = "restore-test-pass"
+    ACC = "wxid_test_acc"
+    CHAT = TestBackupSelective.CHAT_A
+    SENDER = "wxid_test_sender"
+
+    def _build_fake_wechat(self, db_dir: Path, key: bytes, rows_spec):
+        """rows_spec: [(sid, ctime, content)] → 加密的 message_0.db + session.db
+
+        库体必须以 reserved=80 的空库为种子自举（原生 sqlite3 建的库
+        reserved=0，页尾 80 字节会被 encrypt_database 拒绝/砍掉）。"""
+        import hashlib as _h
+        from siwx.sqlcipher import encrypt_database as _enc, \
+            decrypt_database as _dec
+        msg_dir = db_dir / "message"
+        sess_dir = db_dir / "session"
+        msg_dir.mkdir(parents=True, exist_ok=True)
+        sess_dir.mkdir(parents=True, exist_ok=True)
+        tbl = "Msg_" + _h.md5(self.CHAT.encode()).hexdigest()
+
+        def reserved80_empty(dest: Path):
+            """手工构造合法 SQLite 空库（page_size=4096、reserved=80）。
+            原生 sqlite3 建的库 reserved=0，会被 encrypt_database 拒绝。"""
+            b = bytearray(4096)
+            b[0:16] = b"SQLite format 3\x00"
+            b[16:18] = (4096).to_bytes(2, "big")
+            b[18] = 1
+            b[19] = 1
+            b[20] = 80                                   # reserved ← 关键
+            b[21] = 64
+            b[22] = 32
+            b[23] = 32
+            b[24:28] = (1).to_bytes(4, "big")            # change counter
+            b[28:32] = (1).to_bytes(4, "big")            # size in pages
+            b[40:44] = (1).to_bytes(4, "big")            # schema cookie
+            b[44:48] = (4).to_bytes(4, "big")            # schema format
+            b[56:60] = (1).to_bytes(4, "big")            # utf8
+            b[92:96] = (3045001).to_bytes(4, "big")
+            b[100] = 0x0D                                # leaf table b-tree
+            b[103:105] = (0).to_bytes(2, "big")          # ncell = 0
+            b[105:107] = (4016).to_bytes(2, "big")       # content start
+            b[107] = 0                                   # fragmented
+            dest.write_bytes(bytes(b))
+
+        plain = db_dir / "_plain_m0.db"
+        reserved80_empty(plain)
+        c = sqlite3.connect(str(plain))
+        c.execute("CREATE TABLE Name2Id(user_name TEXT, is_session INTEGER)")
+        c.execute("INSERT INTO Name2Id VALUES(?, 1)", (self.CHAT,))
+        c.execute("INSERT INTO Name2Id VALUES(?, 0)", (self.SENDER,))
+        c.execute(MSG_DDL.format(tag=_h.md5(self.CHAT.encode()).hexdigest()))
+        for i, (sid, ctime, content) in enumerate(rows_spec, start=1):
+            c.execute(
+                f"INSERT INTO [{tbl}] (local_id, server_id, local_type, "
+                "sort_seq, real_sender_id, create_time, status, server_seq, "
+                "origin_source, source, message_content) "
+                "VALUES(?,?,1,?,2,?,3,?,2,'s',?)",
+                (i, sid, ctime * 1000, ctime,
+                 sid * 10 if sid else 0, content))
+        c.commit()
+        c.close()
+        _enc(plain, msg_dir / "message_0.db", key)
+        plain.unlink()
+        sp = sess_dir / "session.db"
+        splain = db_dir / "_plain_s.db"
+        reserved80_empty(splain)
+        c = sqlite3.connect(str(splain))
+        c.execute("CREATE TABLE SessionTable(username TEXT, summary TEXT, "
+                  "last_timestamp INTEGER)")
+        c.execute("CREATE TABLE Name2Id(user_name TEXT)")
+        c.execute("CREATE TABLE SessionDeleteTable(username TEXT, "
+                  "delete_time INTEGER)")
+        c.commit()
+        c.close()
+        _enc(splain, sp, key)
+        splain.unlink()
+
+    def _fake_env(self, td: Path, live_rows, pack_rows):
+        """返回 (stage, store, db_dir)。live_rows=真库已有；pack_rows=包内。"""
+        import hashlib as _h
+        from siwx.pack import write_pack
+        key = bytes(range(32))
+        db_dir = td / "fake_wechat" / self.ACC / "db_storage"
+        self._build_fake_wechat(db_dir, key, live_rows)
+        # 两个加密库的 salt 都要注册进 keystore（collect_db_files 全收集）
+        store = {}
+        for f in (db_dir / "message" / "message_0.db",
+                  db_dir / "session" / "session.db"):
+            salt_hex = f.read_bytes()[:16].hex()
+            store[salt_hex] = {"key": key.hex(), "strategy": "test",
+                               "updated": 0}
+        # 包：构造包内明文 message_0.db（含 pack_rows），打包
+        src = td / "pack_src"
+        src.mkdir(parents=True, exist_ok=True)
+        c = sqlite3.connect(str(src / "message_0.db"))
+        c.execute("CREATE TABLE Name2Id(user_name TEXT, is_session INTEGER)")
+        c.execute("INSERT INTO Name2Id VALUES(?, 1)", (self.CHAT,))
+        c.execute("INSERT INTO Name2Id VALUES(?, 0)", (self.SENDER,))
+        c.execute(MSG_DDL.format(tag=_h.md5(self.CHAT.encode()).hexdigest()))
+        for i, (sid, ctime, content) in enumerate(pack_rows, start=1):
+            c.execute(
+                f"INSERT INTO [Msg_{_h.md5(self.CHAT.encode()).hexdigest()}] "
+                "(local_id, server_id, local_type, sort_seq, real_sender_id, "
+                "create_time, status, server_seq, origin_source, source, "
+                "message_content) VALUES(?,?,1,?,2,?,3,?,2,'s',?)",
+                (i, sid, ctime * 1000, ctime,
+                 sid * 10 if sid else 0, content))
+        c.commit()
+        c.close()
+        files = [("message/message_0.db", src / "message_0.db")]
+        from siwx.pack import write_pack as _wp
+        pack = td / "p.siwxpack"
+        _wp(pack, self.PW, files,
+            {"mode": "selective", "account": self.ACC,
+             "created_at": "2026-10-24T12:00:00", "selection": {}})
+        from siwx import restore as _restore
+        stage = _restore.stage_pack(pack, self.PW, stage_root=td / "stages")
+        return stage, store, db_dir
+
+    def test_analyze_wechat_diff_and_apply_idempotent(self):
+        import hashlib as _h
+        from siwx import restore as _restore
+        base = 1900000000
+        live = [(101, base, "a"), (102, base + 10, "b")]
+        pack = [(101, base, "a"), (102, base + 10, "b"),
+                (103, base + 20, "c"), (104, base + 30, "d")]
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            stage, store, db_dir = self._fake_env(td, live, pack)
+            with mock.patch("siwx.discover.find_wechat_data_dirs",
+                            return_value=[(self.ACC, db_dir)]), \
+                 mock.patch("siwx.discover.find_wechat_pids", return_value=[]), \
+                 mock.patch("siwx.keystore.load", return_value=store):
+                rep = _restore.analyze_wechat(stage)
+            self.assertEqual(rep["target"], "wechat")
+            self.assertEqual(rep["total_pack"], 4)
+            self.assertEqual(rep["total_dup"], 2)
+            self.assertEqual(rep["total_insert"], 2)
+            chat = next(c for c in rep["chats"]
+                        if c["username"] == self.CHAT)
+            self.assertTrue(chat["table_exists"])
+
+            # apply（全库会话）→ 插 2 条进假微信库
+            with mock.patch("siwx.discover.find_wechat_data_dirs",
+                            return_value=[(self.ACC, db_dir)]), \
+                 mock.patch("siwx.discover.find_wechat_pids", return_value=[]), \
+                 mock.patch("siwx.keystore.load", return_value=store):
+                res = _restore.apply_wechat(stage, log=lambda *_a: None)
+            self.assertEqual(res["inserted"], 2)
+            self.assertIn("message/message_0.db", res["rewrote"])
+            # 解密重写后的真库验证
+            tbl = "Msg_" + _h.md5(self.CHAT.encode()).hexdigest()
+            from siwx.sqlcipher import decrypt_database
+            back = td / "verify.db"
+            decrypt_database(db_dir / "message" / "message_0.db", back, bytes(range(32)))
+            c = sqlite3.connect(str(back))
+            sids = {r[0] for r in c.execute(f"SELECT server_id FROM [{tbl}]")}
+            mx = c.execute(f"SELECT MAX(local_id) FROM [{tbl}]").fetchone()[0]
+            seq = c.execute("SELECT seq FROM sqlite_sequence WHERE name=?",
+                            (tbl,)).fetchone()
+            c.close()
+            self.assertEqual(sids, {101, 102, 103, 104})
+            self.assertEqual((mx, seq[0]), (4, 4))
+
+            # 幂等：再 analyze → 0 将恢复
+            stage2 = _restore.stage_pack(
+                td / "p.siwxpack", self.PW, stage_root=td / "stages")
+            with mock.patch("siwx.discover.find_wechat_data_dirs",
+                            return_value=[(self.ACC, db_dir)]), \
+                 mock.patch("siwx.discover.find_wechat_pids", return_value=[]), \
+                 mock.patch("siwx.keystore.load", return_value=store):
+                rep2 = _restore.analyze_wechat(stage2)
+            self.assertEqual(rep2["total_insert"], 0)
+
+    def test_apply_wechat_chat_filter(self):
+        """勾选过滤：只恢复勾选的联系人——未勾选的不写入。"""
+        import hashlib as _h
+        from siwx import restore as _restore
+        base = 1900000000
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            # 复用 _fake_env（单会话 fixture）+ 一个包外联系人过滤即可验证过滤路径
+            stage, store, db_dir = self._fake_env(
+                td, [], [(201, base, "x"), (202, base + 5, "y")])
+            other = "wxid_test_not_in_pack"
+            with mock.patch("siwx.discover.find_wechat_data_dirs",
+                            return_value=[(self.ACC, db_dir)]), \
+                 mock.patch("siwx.discover.find_wechat_pids", return_value=[]), \
+                 mock.patch("siwx.keystore.load", return_value=store):
+                res = _restore.apply_wechat(stage, chats=[other],
+                                            log=lambda *_a: None)
+            # 勾选的联系人在包内没有消息 → 0 插入
+            self.assertEqual(res["inserted"], 0)
+            tbl = "Msg_" + _h.md5(self.CHAT.encode()).hexdigest()
+            from siwx.sqlcipher import decrypt_database
+            back = td / "v.db"
+            decrypt_database(db_dir / "message" / "message_0.db", back,
+                             bytes(range(32)))
+            c = sqlite3.connect(str(back))
+            n = c.execute(f"SELECT COUNT(*) FROM [{tbl}]").fetchone()[0]
+            c.close()
+            self.assertEqual(n, 0)     # 未勾选 → 未写入
+
+    def test_merge_rows_keeps_server_id_zero_rows(self):
+        """[P1-2 回归] apply_wechat/_merge_rows_into_plain 路径：
+        server_id=0/NULL 多条全部落库，不按裸 server_id 去重跳过。"""
+        import hashlib as _h
+        from siwx import restore as _restore
+        base = 1900000000
+        live = [(101, base, "a")]
+        pack = [(101, base, "a"),                 # 与真库重复 → dup
+                (0, base + 1, "sys-zero-1"),
+                (0, base + 2, "sys-zero-2"),      # 两条 0 值并存
+                (None, base + 3, "sys-null"),     # 一条 NULL
+                (202, base + 4, "b")]
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            stage, store, db_dir = self._fake_env(td, live, pack)
+            with mock.patch("siwx.discover.find_wechat_data_dirs",
+                            return_value=[(self.ACC, db_dir)]), \
+                 mock.patch("siwx.discover.find_wechat_pids", return_value=[]), \
+                 mock.patch("siwx.keystore.load", return_value=store):
+                rep = _restore.analyze_wechat(stage)
+            self.assertEqual(rep["total_pack"], 5)      # 0/NULL 行逐行计数
+            self.assertEqual(rep["total_dup"], 1)       # 仅 101
+            self.assertEqual(rep["total_insert"], 4)
+            with mock.patch("siwx.discover.find_wechat_data_dirs",
+                            return_value=[(self.ACC, db_dir)]), \
+                 mock.patch("siwx.discover.find_wechat_pids", return_value=[]), \
+                 mock.patch("siwx.keystore.load", return_value=store):
+                res = _restore.apply_wechat(stage, log=lambda *_a: None)
+            self.assertEqual(res["inserted"], 4)
+            self.assertEqual(res["dup"], 1)
+            # 解密重写后的真库验证：5 行齐全，0 值 2 条、NULL 1 条
+            tbl = "Msg_" + _h.md5(self.CHAT.encode()).hexdigest()
+            from siwx.sqlcipher import decrypt_database
+            back = td / "verify.db"
+            decrypt_database(db_dir / "message" / "message_0.db", back,
+                             bytes(range(32)))
+            c = sqlite3.connect(str(back))
+            rows = c.execute(
+                f"SELECT server_id, message_content FROM [{tbl}] "
+                f"ORDER BY sort_seq").fetchall()
+            c.close()
+            self.assertEqual([r[1] for r in rows],
+                             ["a", "sys-zero-1", "sys-zero-2", "sys-null", "b"])
+            self.assertEqual(sum(1 for r in rows if r[0] == 0), 2)
+            self.assertEqual(sum(1 for r in rows if r[0] is None), 1)
+
+    def test_apply_wechat_rejects_manifest_account_traversal(self):
+        """[P1-6 回归] manifest account 为 `../..` 时 analyze_wechat /
+        apply_wechat 一律拒绝，真库不被改写；正常 account 不受影响
+        （正常路径由 test_analyze_wechat_diff_and_apply_idempotent 覆盖）。"""
+        from siwx import restore as _restore
+        base = 1900000000
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            stage, store, db_dir = self._fake_env(td, [], [(201, base, "x")])
+            stage["manifest"]["account"] = "../.."
+            with mock.patch("siwx.discover.find_wechat_data_dirs",
+                            return_value=[(self.ACC, db_dir)]), \
+                 mock.patch("siwx.discover.find_wechat_pids",
+                            return_value=[]), \
+                 mock.patch("siwx.keystore.load", return_value=store):
+                with self.assertRaises(_restore.RestoreError):
+                    _restore.analyze_wechat(stage)
+                with self.assertRaises(_restore.RestoreError):
+                    _restore.apply_wechat(stage, log=lambda *_a: None)
+            # 真库未被改写：解密回读行数仍为 0
+            from siwx.sqlcipher import decrypt_database
+            tbl = "Msg_" + hashlib.md5(self.CHAT.encode()).hexdigest()
+            back = td / "verify.db"
+            decrypt_database(db_dir / "message" / "message_0.db", back,
+                             bytes(range(32)))
+            c = sqlite3.connect(str(back))
+            n = c.execute(f"SELECT COUNT(*) FROM [{tbl}]").fetchone()[0]
+            c.close()
+            self.assertEqual(n, 0)
+
+
+# ── P2-2/P2-3：视频/文件附件导出 + 合并转发语音子项导出 ─────────
+
+class TestVideoFileAttachmentExport(TempRootCase):
+    """P2-2：聊天导出纳入视频(43)与文件(6/49-appmsg type=6)附件。
+
+    磁盘文件复用 media_backup 的未加密复制链路：msg/video/**/<md5>.mp4、
+    msg/file/**/<原文件名>。manifest 新增 videos_*/files_* 计数口径；
+    文件缺失按 skipped 留痕，不阻塞导出。"""
+
+    VIDEO_MD5 = "e" * 32
+
+    def setUp(self):
+        super().setUp()
+        self.acc, self.account, self.chat = make_account(self.tmp, n_texts=2)
+        conn = sqlite3.connect(self.acc / "message" / "message_0.db")
+        t = _msg_table(self.chat)
+        video_xml = ('<msg><videomsg aeskey="k" cdnvideourl="x" '
+                     f'md5="{self.VIDEO_MD5}" length="100" /></msg>').encode()
+        file_xml = ('<msg><appmsg appid="" sdkver="0"><title>报告.pdf</title>'
+                    '<totallen>10</totallen><fileext>pdf</fileext></appmsg>'
+                    '</msg>').encode()
+        legacy_file_xml = ('<msg><appmsg type="6" title="data.zip">'
+                           '<title>data.zip</title></appmsg></msg>').encode()
+        # local_id 顺延（make_account 已写 1/2 两条文本）
+        conn.execute(f"INSERT INTO [{t}] VALUES (?,?,?,?,?,?,?,?)",
+                     (3, 1003, 43, 1_700_000_003, 0, 1, video_xml, None))
+        conn.execute(f"INSERT INTO [{t}] VALUES (?,?,?,?,?,?,?,?)",
+                     (4, 1004, 49, 1_700_000_004, 0, 1, file_xml, None))
+        conn.execute(f"INSERT INTO [{t}] VALUES (?,?,?,?,?,?,?,?)",
+                     (5, 1005, 6, 1_700_000_005, 0, 1, legacy_file_xml, None))
+        conn.commit()
+        conn.close()
+        # 假账号数据根：msg/video、msg/file 假文件（合成内容）
+        self.wx_root = self.tmp / "wxdata" / self.account
+        vdir = self.wx_root / "msg" / "video" / "2026-10"
+        vdir.mkdir(parents=True)
+        self.video_src = vdir / f"{self.VIDEO_MD5}.mp4"
+        self.video_src.write_bytes(b"fake-mp4-bytes")
+        fdir = self.wx_root / "msg" / "file" / "2026-10"
+        fdir.mkdir(parents=True)
+        self.file_src = fdir / "报告.pdf"
+        self.file_src.write_bytes(b"%PDF-1.4 fake")
+        (fdir / "data.zip").write_bytes(b"PK\x03\x04 fake-zip")
+
+    def _export(self, **kw):
+        with mock.patch.object(exporter, "_account_msg_root",
+                               lambda account: self.wx_root):
+            return exporter.run_export(
+                self.acc, self.account, self.chat, "联系人B", "json",
+                want_messages=True, want_media=True, want_avatars=False,
+                export_root=self.tmp / "exports", pack="none",
+                progress=lambda p, m: None)
+
+    def test_video_and_file_attachments_exported(self):
+        res = self._export()
+        out_dir = Path(res["export_dir"])
+        media = out_dir / "media"
+        videos = sorted(media.glob("video_*.mp4"))
+        files = sorted(media.glob("file_*"))
+        self.assertEqual(len(videos), 1)
+        self.assertEqual(videos[0].read_bytes(), b"fake-mp4-bytes")
+        self.assertEqual(len(files), 2)
+        blobs = {f.read_bytes() for f in files}
+        self.assertEqual(blobs, {b"%PDF-1.4 fake", b"PK\x03\x04 fake-zip"})
+        # 消息体回填 mediaFile，格式产物可引用
+        d = json.loads((out_dir / Path(res["files"][0]).name)
+                       .read_text(encoding="utf-8"))
+        by_type = {m["localType"]: m for m in d["messages"]}
+        self.assertEqual(by_type[43]["mediaFile"], f"media/{videos[0].name}")
+        pdf = next(f for f in files if f.suffix == ".pdf")
+        zipf = next(f for f in files if f.suffix == ".zip")
+        self.assertEqual(by_type[49]["mediaFile"], f"media/{pdf.name}")
+        self.assertEqual(by_type[6]["mediaFile"], f"media/{zipf.name}")
+        # manifest 计数口径
+        manifest = json.loads((out_dir / "manifest.json")
+                              .read_text(encoding="utf-8"))
+        m = manifest["media"]
+        self.assertEqual(m["videos_requested"], 1)
+        self.assertEqual(m["videos_ok"], 1)
+        self.assertEqual(m["videos_skipped"], 0)
+        self.assertEqual(m["files_requested"], 2)
+        self.assertEqual(m["files_ok"], 2)
+        self.assertEqual(m["files_skipped"], 0)
+        self.assertEqual(res["video_count"], 1)
+        self.assertEqual(res["file_count"], 2)
+
+    def test_missing_attachments_counted_as_skipped(self):
+        """微信会自动清理旧视频正文：磁盘缺失按 skipped 留痕，导出不失败。"""
+        self.video_src.unlink()
+        res = self._export()
+        manifest = json.loads(
+            (Path(res["export_dir"]) / "manifest.json").read_text(encoding="utf-8"))
+        m = manifest["media"]
+        self.assertEqual(m["videos_requested"], 1)
+        self.assertEqual(m["videos_ok"], 0)
+        self.assertEqual(m["videos_skipped"], 1)
+        self.assertEqual(m["files_ok"], 2)
+
+    def test_metadata_scan_gathers_video_md5_and_file_title(self):
+        from siwx.exporter import _collect_metadata
+        res = _collect_metadata(self.acc, self.chat, None, None,
+                                self.account, None)
+        videos, file_refs = res[7], res[8]
+        self.assertEqual(videos, [(self.VIDEO_MD5, 3, 1_700_000_003)])
+        self.assertEqual([(t, lid, ts) for t, lid, ts in file_refs],
+                         [("报告.pdf", 4, 1_700_000_004),
+                          ("data.zip", 5, 1_700_000_005)])
+
+
+class TestRecordVoiceSubitemExport(TempRootCase):
+    """P2-3：合并转发子项的语音走 get_voice(svr_id=fromnewmsgid) 导出；
+    视频/文件子项暂不在导出范围，manifest 计数留痕。"""
+
+    def setUp(self):
+        super().setUp()
+        self.acc, self.account, self.chat = make_account(self.tmp, n_texts=1)
+        # 原始语音消息：server_id=910100，VoiceInfo 与之对应
+        t = _msg_table(self.chat)
+        conn = sqlite3.connect(self.acc / "message" / "message_0.db")
+        voice_xml = b'<msg><voicemsg voicelength="1000" length="12" /></msg>'
+        conn.execute(f"INSERT INTO [{t}] VALUES (?,?,?,?,?,?,?,?)",
+                     (2, 910100, 34, 1_700_000_002, 0, 1, voice_xml, None))
+        record_xml = (
+            '<msg><appmsg type="19"><title>聊天记录</title><recordinfo>'
+            '<dataitem datatype="34" dataid="1"><sourcename>张三</sourcename>'
+            '<sourcetime>1700000002</sourcetime><datadesc>[语音]</datadesc>'
+            '<fromnewmsgid>910100</fromnewmsgid>'
+            '<srcMsgLocalid>2</srcMsgLocalid>'
+            '<srcMsgCreateTime>1700000002</srcMsgCreateTime></dataitem>'
+            '<dataitem datatype="4" dataid="2"><sourcename>张三</sourcename>'
+            '<sourcetime>1700000003</sourcetime><datadesc>[视频]</datadesc>'
+            '</dataitem>'
+            '<dataitem datatype="6" dataid="3"><sourcename>李四</sourcename>'
+            '<sourcetime>1700000004</sourcetime><datadesc>[文件]</datadesc>'
+            '</dataitem>'
+            '</recordinfo></appmsg></msg>').encode()
+        conn.execute(f"INSERT INTO [{t}] VALUES (?,?,?,?,?,?,?,?)",
+                     (3, 1003, 49, 1_700_000_010, 0, 1, record_xml, None))
+        conn.commit()
+        conn.close()
+        db = self.acc / "message" / "media_0.db"
+        conn = sqlite3.connect(db)
+        conn.execute("DROP TABLE unrelated")
+        conn.execute("CREATE TABLE Name2Id (user_name TEXT)")
+        conn.execute("INSERT INTO Name2Id(rowid, user_name) VALUES (1, ?)",
+                     (self.chat,))
+        conn.execute("CREATE TABLE VoiceInfo (chat_name_id INTEGER, "
+                     "create_time INTEGER, local_id INTEGER, svr_id INTEGER, "
+                     "voice_data BLOB, data_index TEXT)")
+        conn.execute("INSERT INTO VoiceInfo VALUES (?,?,?,?,?,?)",
+                     (1, 1_700_000_002, 2, 910100, b"\x02#!SILK_V3subitem", "0"))
+        conn.commit()
+        conn.close()
+
+    def test_voice_subitem_exported_and_media_file_attached(self):
+        from siwx import exporter as ex
+        old = ex.voice.transcode_voice
+        try:
+            ex.voice.transcode_voice = lambda data, target="wav": (
+                b"RIFFxxxxWAVEfmt ", {"format": "wav", "mimetype": "audio/wav",
+                                      "ext": "wav", "engine": "fake"})
+            res = ex.run_export(self.acc, self.account, self.chat, "联系人B",
+                                fmt="json", want_media=False, want_voice=True,
+                                want_avatars=False,
+                                export_root=self.tmp / "exports", pack="none")
+        finally:
+            ex.voice.transcode_voice = old
+        out_dir = Path(res["export_dir"])
+        voices = sorted((out_dir / "media").glob("voice_*.wav"))
+        self.assertEqual(len(voices), 1, "语音子项应经 get_voice 导出")
+        self.assertEqual(voices[0].read_bytes(), b"RIFFxxxxWAVEfmt ")
+        self.assertEqual(res["voice_count"], 1)
+        d = json.loads((out_dir / Path(res["files"][0]).name)
+                       .read_text(encoding="utf-8"))
+        rec_msg = next(m for m in d["messages"] if m["localType"] == 49)
+        items = rec_msg["record"]["items"]
+        voice_item = next(it for it in items if it["datatype"] == "34")
+        self.assertEqual(voice_item["mediaFile"], f"media/{voices[0].name}")
+        # manifest：语音子项计入 voices 口径；视频/文件子项计数留痕
+        manifest = json.loads((out_dir / "manifest.json")
+                              .read_text(encoding="utf-8"))
+        m = manifest["media"]
+        self.assertEqual(m["voices_requested"], 1)
+        self.assertEqual(m["voices_ok"], 1)
+        self.assertEqual(m["record_subitem_voices"], 1)
+        self.assertEqual(m["record_subitem_videos"], 1)
+        self.assertEqual(m["record_subitem_files"], 1)
+
+    def test_attach_record_voice_uses_voice_slot(self):
+        """语音子项按语音槽位键回填；图片槽位命中 voice_ 文件名仍拒挂
+        （原有互斥语义不变）。"""
+        from siwx import exporter as ex
+        rec = {"items": [
+            {"kind": "voice", "datatype": "34", "srcLocalId": 2,
+             "srcCreateTime": 1_700_000_002},
+            {"kind": "image", "md5": "f" * 32, "srcLocalId": 5,
+             "srcCreateTime": 30},
+        ]}
+        msg = {"localType": 49, "localId": 3, "createTime": 1_700_000_010,
+               "record": rec}
+        media_map = {
+            ex._voice_key(2, 1_700_000_002): "media/voice_0000_2.wav",
+            # 图片键错挂语音文件：必须拒挂（槽位互斥）
+            ex._media_key("f" * 32, None, 5, 30): "media/voice_0001.wav",
+        }
+        ex._attach_media(msg, media_map)
+        self.assertEqual(rec["items"][0]["mediaFile"], "media/voice_0000_2.wav")
+        self.assertNotIn("mediaFile", rec["items"][1])
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

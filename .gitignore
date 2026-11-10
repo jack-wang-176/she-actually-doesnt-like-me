@@ -1,0 +1,33 @@
+# Python & Runtime
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# Strictly Isolated Private Vault (All Chat Logs, Keys, DBs & Personal Files)
+_private_vault/
+platforms/
+contacts/
+data/
+reports/
+profile/
+raw_data/
+output/
+daini/
+vendor/
+scripts/tmp/
+SIWX/output/
+SIWX/logs/
+identity_links.json
+
+# Keys & Databases
+*.key
+*.db
+*.sqlite
+*.sqlite3
+*keystore*.json
+
+# macOS / System
+.DS_Store

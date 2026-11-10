@@ -1,0 +1,391 @@
+"""SQLCipher 4 页级编解码与密钥验证原语。
+
+逻辑参考原 pc_wechat_exp（已验证实现），独立整理：
+page_size=4096、AES-256-CBC、HMAC-SHA512、PBKDF2-SHA512×2、
+reserve=80、每页 IV 存于 reserve 区前 16 字节、page1 前 16 字节为 salt。
+验证一个候选密钥只需文件前 4KB —— 全系统的验证咽喉。
+"""
+import hashlib
+import hmac
+import os
+import shutil
+import struct
+import tempfile
+import time
+from pathlib import Path
+
+from siwx import logger as _slog
+
+PAGE_SZ = 4096
+KEY_SZ = 32
+SALT_SZ = 16
+RESERVE_SZ = 80
+IV_SZ = 16
+HMAC_SZ = 64
+SQLITE_HDR = b"SQLite format 3\x00"
+
+
+def parse_key(hex_key: str) -> bytes:
+    h = hex_key.strip().lower()
+    if len(h) != KEY_SZ * 2:
+        raise ValueError("密钥长度不是 64 位 hex")
+    return bytes.fromhex(h)
+
+
+def mask_key(k: str) -> str:
+    """密钥打码（6+4）。
+
+    下沉到本层（审计核查 C.4）：extract.py 导入 sqlcipher，本层的异常消息
+    若要携带打码密钥，反向 import extract 会循环导入。extract.py 改为
+    `from siwx.sqlcipher import mask_key`，`extract.mask_key` 名字保持可访问
+    （cli.py 依赖）。"""
+    if len(k) <= 10:
+        return "…"
+    return f"{k[:6]}…{k[-4:]}"
+
+
+def _mac_key(enc_key: bytes, salt: bytes) -> bytes:
+    """页 HMAC 密钥：PBKDF2-HMAC-SHA512(enc_key, salt^0x3A, 2) → 32 字节。
+
+    与 verify_enc_key 同一套参数——加解密两侧必须共用，否则 WeChat 认不出
+    写出来的库。
+    """
+    mac_salt = bytes(b ^ 0x3A for b in salt)
+    return hashlib.pbkdf2_hmac("sha512", enc_key, mac_salt, 2, dklen=KEY_SZ)
+
+
+def verify_enc_key(enc_key: bytes, page1: bytes) -> bool:
+    """SQLCipher 4 page-1 HMAC 校验（恒时比较）。"""
+    if len(page1) < PAGE_SZ:
+        return False
+    salt = page1[:SALT_SZ]
+    mac_key = _mac_key(enc_key, salt)
+    hmac_data = page1[SALT_SZ: PAGE_SZ - RESERVE_SZ + IV_SZ]
+    stored = page1[PAGE_SZ - HMAC_SZ:]
+    hm = hmac.new(mac_key, hmac_data, hashlib.sha512)
+    hm.update(struct.pack("<I", 1))
+    return hmac.compare_digest(hm.digest(), stored)
+
+
+class DbEntry:
+    __slots__ = ("rel", "path", "size", "salt_hex", "page1")
+
+    def __init__(self, rel, path, size, salt_hex, page1):
+        self.rel = rel
+        self.path = path
+        self.size = size
+        self.salt_hex = salt_hex
+        self.page1 = page1
+
+
+def _read_page1(path: Path):
+    try:
+        with open(path, "rb") as f:
+            page1 = f.read(PAGE_SZ)
+    except OSError:
+        # 微信占用中：复制到临时文件再读。
+        # 必须用 mkstemp 生成唯一名：Flask 以 threaded=True 运行，且 /api/status
+        # 每次请求都会走这里，「微信占用中」时同进程多线程会同时复制。旧实现
+        # 用 f"siwx_p1_{os.getpid()}.tmp" 只含 PID，两个线程会撞名互相覆盖，
+        # 导致读到对方的 page1 → salt 张冠李戴 → 污染 DPAPI 密钥库。
+        tmp = None
+        try:
+            fd, name = tempfile.mkstemp(prefix="siwx_p1_", suffix=".tmp")
+            os.close(fd)
+            tmp = Path(name)
+            shutil.copy2(path, tmp)
+            with open(tmp, "rb") as f:
+                page1 = f.read(PAGE_SZ)
+        except OSError:
+            return None
+        finally:
+            if tmp is not None:
+                tmp.unlink(missing_ok=True)
+    if len(page1) < PAGE_SZ or page1.count(0) == PAGE_SZ:
+        return None
+    return page1
+
+
+def collect_db_files(db_dir: str):
+    """递归收集 db_storage 下全部 .db（排除 -wal/-shm）。"""
+    root = Path(db_dir)
+    if not root.is_dir():
+        raise FileNotFoundError(f"目录不存在: {db_dir}")
+    out = []
+    for dirpath, _dirs, files in os.walk(root):
+        for name in files:
+            if not name.endswith(".db") or name.endswith("-wal") or name.endswith("-shm"):
+                continue
+            p = Path(dirpath) / name
+            try:
+                size = p.stat().st_size
+            except OSError:
+                continue
+            if size < PAGE_SZ:
+                continue
+            page1 = _read_page1(p)
+            if page1 is None:
+                continue
+            rel = str(p.relative_to(root))
+            out.append(DbEntry(rel, p, size, page1[:SALT_SZ].hex(), page1))
+    out.sort(key=lambda e: e.rel)
+    return out
+
+
+# 陈旧 `.part` 的判定年龄（秒）：池中断/进程被杀留下的半成品超过该时长才清理
+STALE_PART_MAX_AGE = 3600
+
+
+def _clean_stale_parts(dst: Path) -> None:
+    """清理同目标的陈旧解密临时文件（P3-6）。
+
+    decrypt_database 用 mkstemp 生成 `<dst>.<随机>.part`；进程被杀/进程池中断时
+    残留文件永远不会被 os.replace 消费，会一直占着磁盘。只删 mtime 超过
+    STALE_PART_MAX_AGE 的项——刚创建或并发中的新文件不能碰（另一线程/进程可能
+    正在写同一个目标），清理失败也只留待下一轮。
+    """
+    try:
+        candidates = list(dst.parent.glob(dst.name + ".*.part"))
+    except OSError:
+        return
+    if not candidates:
+        return
+    now = time.time()
+    removed = 0
+    for p in candidates:
+        try:
+            if now - p.stat().st_mtime <= STALE_PART_MAX_AGE:
+                continue
+            p.unlink()
+            removed += 1
+        except OSError:
+            continue
+    if removed:
+        _slog.detailed("cipher",
+                       f"清理陈旧解密临时文件 {removed} 个（dst={dst.name}）")
+
+
+def decrypt_database(src: Path, dst: Path, enc_key: bytes, progress=None) -> int:
+    """流式整库解密：页读 → AES-256-CBC → 明文 SQLite 写出。返回总页数。
+
+    优化（v0.3.2）:
+    - 内联 CBC XOR：消除函数调用开销（~9% 提升）
+    - 预计算常量：CT_LEN 提到循环外
+    - 进度回调降频：每 100 页回调一次
+
+    优化（CBC 链式 XOR）:
+    - 由「大整数 ``from_bytes``/``to_bytes``」改为 pycryptodome 的 C 实现
+      ``strxor.strxor``。原写法占单库解密耗时约 39%（``from_bytes`` 28%
+      + ``to_bytes`` 11%），实测内核 164 → 419 MB/s、整账号端到端 1.39x，
+      输出**字节级等价**（见 ``tests/test_regressions.py::TestCryptoIntact``）。
+      ``strxor`` 属于既有的 pycryptodome 依赖，未引入任何新的外部依赖。
+    """
+    from Crypto.Cipher import AES
+    from Crypto.Util import strxor
+
+    tmp_copy = None
+    tmp_out = None
+    try:
+        fin = open(src, "rb", buffering=8 * 1024 * 1024)
+    except OSError:
+        # 同 _read_page1：唯一临时名，避免同进程并发撞名互相覆盖。
+        # 审计 §3.3/核查 B1：三段失败分开抛，错误消息区分「建临时文件失败 /
+        # 复制失败 / 打开副本失败」，不再混为同一个裸 raise。
+        try:
+            fd, name = tempfile.mkstemp(prefix="siwx_db_", suffix=".tmp")
+        except OSError as e:
+            raise OSError(f"创建临时文件失败（源库 {src} 被占用且无法建临时副本）: {e}") from e
+        os.close(fd)
+        tmp_copy = Path(name)
+        try:
+            shutil.copy2(src, tmp_copy)
+        except OSError as e:
+            # 复制失败时立刻清理，否则空的 mkstemp 文件会残留在 TEMP
+            # （异常会跳过下方第二个 try 的 finally）。
+            tmp_copy.unlink(missing_ok=True)
+            tmp_copy = None
+            raise OSError(f"复制 {src} 到临时文件失败: {e}") from e
+        try:
+            fin = open(tmp_copy, "rb", buffering=8 * 1024 * 1024)
+        except OSError as e:
+            tmp_copy.unlink(missing_ok=True)
+            tmp_copy = None
+            raise OSError(f"打开 {src} 的临时副本失败: {e}") from e
+
+    try:
+        size = os.fstat(fin.fileno()).st_size
+        if size < PAGE_SZ:
+            raise ValueError("文件不足一页")
+        page1 = fin.read(PAGE_SZ)
+        if not verify_enc_key(enc_key, page1):
+            # 上下文进异常消息（多账号场景定位是哪个库哪个密钥；严守脱敏口径）
+            raise ValueError(
+                f"page1 HMAC 验证失败（密钥不匹配） src={src.name} "
+                f"salt={page1[:SALT_SZ].hex()} key={mask_key(enc_key.hex())}"
+            )
+        dst = Path(dst)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        total_pages = (size + PAGE_SZ - 1) // PAGE_SZ
+
+        # 先写同目录临时文件，整库成功后再原子替换。原实现直接写 dst，一旦解密
+        # 中途异常（磁盘满、源库被截断），会把原本有效的明文库覆盖成截断文件，
+        # 而 manifest 仍认为它是好的 —— 只能整库重解。
+        _clean_stale_parts(dst)   # 上一次中断残留（>1h）先清掉，再建新 .part
+        fd, _tmp_name = tempfile.mkstemp(prefix=dst.name + ".", suffix=".part",
+                                        dir=dst.parent)
+        os.close(fd)
+        tmp_out = Path(_tmp_name)
+
+        # 输出临时文件创建失败（权限/磁盘满）时带上 dst 上下文（审计 §3.3:159）
+        try:
+            fout = open(tmp_out, "wb", buffering=8 * 1024 * 1024)
+        except OSError as e:
+            raise OSError(f"输出临时文件创建失败 dst={dst}: {e}") from e
+        with fout:
+            aes = AES.new(enc_key, AES.MODE_ECB)
+            body_len = PAGE_SZ - RESERVE_SZ  # 4016
+            CT_LEN = body_len - SALT_SZ      # 4000
+            aes_dec = aes.decrypt
+            xor = strxor.strxor             # C 实现，等长入参
+            zeros = b"\x00" * RESERVE_SZ
+
+            # 页 1：前 16 字节是 salt，密文从 16 开始
+            iv = page1[PAGE_SZ - RESERVE_SZ: PAGE_SZ - RESERVE_SZ + IV_SZ]
+            ct = page1[SALT_SZ: body_len]
+            pt = xor(iv + ct[:CT_LEN - 16], aes_dec(ct))
+            fout.write(SQLITE_HDR)
+            fout.write(pt)
+            fout.write(zeros)
+            if progress:
+                progress(1, total_pages)
+
+            # 后续页：内联循环（消除函数调用开销）
+            for pgno, chunk in enumerate(iter(lambda: fin.read(PAGE_SZ), b""), start=2):
+                if len(chunk) < PAGE_SZ:
+                    chunk = chunk + b"\x00" * (PAGE_SZ - len(chunk))
+                iv = chunk[PAGE_SZ - RESERVE_SZ: PAGE_SZ - RESERVE_SZ + IV_SZ]
+                ct = chunk[:body_len]
+                pt = xor(iv + ct[:len(ct) - 16], aes_dec(ct))
+                fout.write(pt)
+                fout.write(zeros)
+                if progress and pgno % 100 == 0:
+                    progress(pgno, total_pages)
+            if progress:
+                progress(total_pages, total_pages)
+        os.replace(tmp_out, dst)   # 原子替换，成功后才覆盖旧明文库
+        tmp_out = None
+        return total_pages
+    finally:
+        fin.close()
+        # 审计核查 C.5：两处 unlink 都可能因文件占用抛 OSError 而掩盖原始
+        # 解密异常，各自包 try 静默（清理失败不该顶掉真实错误）。
+        if tmp_copy:
+            try:
+                tmp_copy.unlink(missing_ok=True)
+            except OSError:
+                pass
+        if tmp_out is not None:
+            try:
+                tmp_out.unlink(missing_ok=True)   # 失败路径清理半成品
+            except OSError:
+                pass
+
+
+def encrypt_database(src: Path, dst: Path, enc_key: bytes, salt: bytes = None,
+                     progress=None) -> int:
+    """流式整库加密：明文 SQLite → SQLCipher 4 密文（decrypt_database 的逆运算）。
+
+    写入微信源库时**必须传原库的 salt**：salt 是密钥库的主键（keystore 以
+    salt_hex 索引密钥），salt 变了等于给同一个库换了个身份——密钥库条目、
+    缓存清单全部对不上。加密器不替调用方做这个决定，由调用方显式传入。
+
+    页面布局（与 decrypt_database 严格对称）：
+      第 1 页：[salt 16][密文 4000][reserve: IV 16 + HMAC 64]
+      其余页：[密文 4016][reserve: IV 16 + HMAC 64]
+      密文区 = AES-256-CBC(body)，IV 每页随机；HMAC-SHA512 覆盖
+      「密文 + IV」（页 1 从 salt 之后开始），末尾追加小端页号。
+
+    明文侧：reserve 区保持 SQLite 的 80 字节保留空间（零），故明文页长
+    4096、数据区 4016（第 1 页前 16 字节是 "SQLite format 3\\0" 文件头）。
+
+    返回总页数。写入同样是「临时文件 + 原子替换」，中途失败不会留下半个
+    目标文件。
+    """
+    from Crypto.Cipher import AES
+
+    src = Path(src)
+    dst = Path(dst)
+    if len(enc_key) != KEY_SZ:
+        raise ValueError("密钥长度不是 32 字节")
+    if salt is None:
+        salt = os.urandom(SALT_SZ)
+    if len(salt) != SALT_SZ:
+        raise ValueError("salt 长度不是 16 字节")
+
+    tmp_out = None
+    try:
+        fin = open(src, "rb", buffering=8 * 1024 * 1024)
+    except OSError as e:
+        raise OSError(f"打开明文库失败 src={src}: {e}") from e
+    try:
+        size = os.fstat(fin.fileno()).st_size
+        if size < PAGE_SZ:
+            raise ValueError("明文库不足一页")
+        head = fin.read(PAGE_SZ)
+        if head[:len(SQLITE_HDR)] != SQLITE_HDR:
+            raise ValueError(f"不是 SQLite 明文库 src={src.name}")
+        # 页布局防线：SQLCipher 解密产物的 reserved 恒为 80（header offset 20），
+        # 加密按「数据区 4016 + reserve 80」切分。reserved 非 80 的 SQLite 库
+        # （原生建的默认 0）页尾 80 字节是真实数据——照常加密会静默砍掉它
+        # （实测 fixture 库 malformed）。硬拒绝，防止把损坏库写回微信。
+        if head[20] != RESERVE_SZ:
+            raise ValueError(
+                f"明文库 header reserved={head[20]}（应为 {RESERVE_SZ}）"
+                f"——不是 SQLCipher 解密产物，拒绝加密 src={src.name}")
+        mac_key = _mac_key(enc_key, salt)
+
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        total_pages = (size + PAGE_SZ - 1) // PAGE_SZ
+        fd, _tmp_name = tempfile.mkstemp(prefix=dst.name + ".", suffix=".enc.part",
+                                        dir=dst.parent)
+        os.close(fd)
+        tmp_out = Path(_tmp_name)
+        try:
+            fout = open(tmp_out, "wb", buffering=8 * 1024 * 1024)
+        except OSError as e:
+            raise OSError(f"输出临时文件创建失败 dst={dst}: {e}") from e
+
+        with fout:
+            # 第 1 页：数据区跳过 16 字节 SQLite 文件头
+            iv = os.urandom(IV_SZ)
+            body = head[SALT_SZ: PAGE_SZ - RESERVE_SZ]
+            ct = AES.new(enc_key, AES.MODE_CBC, iv).encrypt(body)
+            hm = hmac.new(mac_key, ct + iv, hashlib.sha512)
+            hm.update(struct.pack("<I", 1))
+            fout.write(salt + ct + iv + hm.digest())
+            if progress:
+                progress(1, total_pages)
+
+            for pgno, chunk in enumerate(iter(lambda: fin.read(PAGE_SZ), b""), start=2):
+                if len(chunk) < PAGE_SZ:
+                    chunk = chunk + b"\x00" * (PAGE_SZ - len(chunk))
+                iv = os.urandom(IV_SZ)
+                body = chunk[:PAGE_SZ - RESERVE_SZ]
+                ct = AES.new(enc_key, AES.MODE_CBC, iv).encrypt(body)
+                hm = hmac.new(mac_key, ct + iv, hashlib.sha512)
+                hm.update(struct.pack("<I", pgno))
+                fout.write(ct + iv + hm.digest())
+                if progress and pgno % 100 == 0:
+                    progress(pgno, total_pages)
+            if progress:
+                progress(total_pages, total_pages)
+        os.replace(tmp_out, dst)   # 原子替换
+        tmp_out = None
+        return total_pages
+    finally:
+        fin.close()
+        if tmp_out is not None:
+            try:
+                tmp_out.unlink(missing_ok=True)
+            except OSError:
+                pass

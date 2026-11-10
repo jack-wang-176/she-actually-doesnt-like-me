@@ -1,0 +1,26 @@
+{
+  "schema_version": "1.0",
+  "node_id": "Archetype_B (双向同频高回报型)",
+  "node_hash": "node_demo_b02",
+  "surface_vitality_score": 81.0,
+  "defilter_multiplier": 1.05,
+  "defiltered_exclusivity_score": 85.0,
+  "illusion_gap": 0.0,
+  "online_anomalies": {
+    "high_fast_reply_passive_init": false,
+    "heavy_word_surplus": false,
+    "utilitarian_reinit": false,
+    "evasive_long_reply": false
+  },
+  "offline_signals": {
+    "broad_social_warmth": false,
+    "public_distance_cutting": false,
+    "shelf_mentality_quote": false,
+    "intermittent_utilitarian_contact": false,
+    "alibi_clubbing_conformity": false,
+    "unilateral_resource_given": false,
+    "companionship_evasion": false
+  },
+  "pathology_count": 0,
+  "detected_pathologies": []
+}

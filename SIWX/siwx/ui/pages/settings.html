@@ -1,0 +1,158 @@
+<div class="settings">
+  <div class="card">
+    <div class="card-head"><h2>版本与更新</h2><span class="hint" id="s-version-meta">检测中…</span></div>
+    <div id="s-version">加载中…</div>
+  </div>
+
+  <div class="card">
+    <div class="card-head"><h2>日志</h2><span class="hint">日志模式控制与脱敏导出</span></div>
+    <div class="s-actions">
+      <div class="s-item">
+        <b>日志模式</b>
+        <span class="dim">详细模式记录所有操作步骤，便于排查问题（会增加日志量）</span>
+        <div class="s-ctl-dd" id="s-log-level"></div>
+      </div>
+      <div class="s-item">
+        <b>导出脱敏日志</b>
+        <span class="dim">导出时自动去除密钥/wxid/路径等敏感信息，可安全分享用于调试</span>
+        <div class="s-ctl">
+          <label class="f-chk"><input type="checkbox" id="s-log-desensitize" checked> 脱敏</label>
+          <button class="btn" id="s-export-log">导出日志</button>
+        </div>
+      </div>
+      <div class="s-item">
+        <b>环境信息</b>
+        <span class="dim">版本、运行模式、系统与架构、关键目录。提 issue 时粘贴这段内容，能大幅加快定位</span>
+        <div class="s-ctl">
+          <button class="btn" id="s-copy-env">复制环境信息</button>
+          <span class="dim" id="s-copy-env-status"></span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-head"><h2>缓存状态</h2><span class="hint">密钥与解密产物都有缓存，重跑不会重复计算</span></div>
+    <div id="s-overview">加载中…</div>
+  </div>
+
+  <div class="card s-card">
+    <div class="card-head"><h2>自动刷新数据库</h2><span class="hint">微信在线时，按间隔自动增量解密变更库</span></div>
+    <div class="s-actions">
+      <div class="s-item">
+        <b>定时增量同步</b>
+        <span class="dim" id="s-auto-sync-status">加载中…</span>
+        <div class="s-inline">
+          <label class="s-switch"><input type="checkbox" id="s-auto-sync-enabled"> 开启</label>
+          <input type="number" id="s-auto-sync-interval" min="1" max="1440" value="30">
+          <span class="dim">分钟</span>
+          <button class="btn btn-primary" id="s-auto-sync-save">保存</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card s-card">
+    <div class="card-head"><h2>清除缓存</h2><span class="hint">清除后下次运行会重新提取/解密</span></div>
+    <div class="s-actions">
+      <div class="s-item s-item-danger">
+        <b>清除解密输出</b>
+        <span class="dim">删除 output 目录下的明文数据库（密钥保留，重跑解密即可恢复）</span>
+        <button class="btn btn-danger" id="s-clear-output">清除解密输出</button>
+      </div>
+      <div class="s-item s-item-danger">
+        <b>清除密钥库</b>
+        <span class="dim">删除 DPAPI 加密的密钥缓存（下次提取需微信在线重新收割）</span>
+        <button class="btn btn-danger" id="s-clear-keys">清除密钥库</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="card s-card">
+    <div class="card-head"><h2>数据源管理</h2><span class="hint">微信数据目录与账号维护（原「引导」的日常入口）</span></div>
+    <div class="s-actions">
+      <div class="s-item s-item-block">
+        <b>已配置的数据目录</b>
+        <span class="dim">每行一个微信号；提取/解密结果有缓存，重跑秒回。重新提取前请保持微信在线。</span>
+        <div id="s-ds-accounts" class="accounts"><div class="empty">加载中…</div></div>
+        <div class="s-inline" style="margin-top:12px">
+          <button class="btn btn-sm" id="s-ds-manual-toggle">＋ 手动添加数据目录</button>
+          <button class="btn btn-sm" id="s-ds-refresh">刷新列表</button>
+        </div>
+        <div id="s-ds-manual-box" class="g-manual hidden">
+          <div class="g-manual-title">直接指定微信数据目录</div>
+          <p class="dim g-manual-hint">可填写 xwechat_files 根目录、账号目录、db_storage、其内部子目录或具体 .db 文件；根目录下有多个账号也会一起识别。<br>
+             微信内获取路径：微信设置 → 文件管理 → 打开文件夹 → 复制地址栏路径。</p>
+          <div class="g-manual-row">
+            <input id="s-ds-manual-path" class="g-input" type="text" placeholder="例如: D:\xwechat_files\wxid_xxx\db_storage">
+            <button class="btn btn-primary" id="s-ds-manual-add">验证并保存</button>
+          </div>
+          <div id="s-ds-manual-msg" class="g-manual-msg"></div>
+        </div>
+      </div>
+      <div class="s-item s-item-block" id="s-ds-run" hidden>
+        <b>提取进度</b>
+        <div class="progress" style="margin-top:8px"><div class="bar" id="s-ds-bar"></div></div>
+        <div class="console" id="s-ds-log" style="margin-top:10px"></div>
+        <div id="s-ds-result" class="g3-res"></div>
+      </div>
+      <div class="s-item">
+        <b>重新运行首启向导</b>
+        <span class="dim">完整重跑「同意条款 → 选号 → 提取解密」全屏向导，适合换机或排查配置问题</span>
+        <button class="btn" id="s-rerun-wizard">重新运行首启向导</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="card s-card">
+    <div class="card-head"><h2>全量媒体备份</h2><span class="hint">按文件枚举 msg/attach、video、file，不依赖消息解析——删除微信数据前的保全手段</span></div>
+    <div class="s-actions">
+      <div class="s-item s-item-block">
+        <b>备份目标账号</b>
+        <span class="dim">图片逐个解密（wxgf 转码失败时保留原始文件，不算失败）；视频与文件附件未加密，直接复制。产物写入该账号输出目录的 media_backup/ 下。</span>
+        <div class="s-inline" style="margin-top:8px">
+          <!-- 备份账号：自绘下拉（widgets.js），选项由 settings.js 按 /api/status 填充 -->
+          <div id="s-mb-account" style="flex:1;min-width:0"></div>
+          <button class="btn btn-primary" id="s-mb-start">开始备份</button>
+          <button class="btn btn-sm hidden" id="s-mb-cancel">取消备份</button>
+        </div>
+        <div id="s-mb-status" class="dim" style="margin-top:6px"></div>
+        <div class="console hidden" id="s-mb-log" style="margin-top:10px"></div>
+        <div id="s-mb-result" class="g3-res" style="margin-top:8px"></div>
+        <div class="s-inline hidden" id="s-mb-open-row" style="margin-top:8px">
+          <button class="btn btn-sm" id="s-mb-open">打开备份目录</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card s-card" id="s-plugins-card" hidden>
+    <div class="card-head">
+      <h2>插件</h2>
+      <span class="hint" id="s-plugins-hint">已加载插件提供的设置项</span>
+    </div>
+    <div id="s-plugins">加载中…</div>
+  </div>
+
+  <div class="card s-card">
+    <div class="card-head"><h2>隐私与免责声明</h2><span class="hint">条款更新后会再次要求确认</span></div>
+    <div class="s-actions">
+      <div class="s-item">
+        <b>免责声明 · 法律声明</b>
+        <span class="dim">使用本项目前请完整阅读全文；声明更新后继续使用即视为接受最新版本</span>
+        <button class="btn" id="s-view-disclaimer">查看全文</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-head"><h2>关于</h2><span class="hint">stories-in-wx</span></div>
+    <div class="about-block">
+      <p>微信 4.x 数据库密钥提取、解密、聊天查看、多格式导出工具。</p>
+      <div class="a-row"><span>开发者</span><b><a href="https://upxuu.com" target="_blank" rel="noopener">UPXUU</a></b></div>
+      <div class="a-row"><span>博客</span><b><a href="https://upxuu.com" target="_blank" rel="noopener">upxuu.com</a></b></div>
+      <div class="a-row"><span>源码</span><b><a href="https://github.com/ImUpXuu/SIWX" target="_blank" rel="noopener">github.com/ImUpXuu/SIWX</a></b></div>
+      <div class="a-row"><span>许可证</span><b>AGPL-3.0（商用支持需另行授权）</b></div>
+    </div>
+  </div>
+</div>

@@ -1,0 +1,113 @@
+{
+  "schema_version": "1.0",
+  "node_id": "Archetype_A (高秒回广谱内耗型)",
+  "node_hash": "node_demo_a01",
+  "development_recommendation": {
+    "recommend_develop": false,
+    "banner": "❌ 坚决不建议发展（立即止损封存）",
+    "reason": "去滤镜后正向发展概率仅 3.3%，净期望值 Net JEV 为 -99.8（滤镜水分高达 84.2 分，触发 5 项高危病灶）。继续投入只会加剧单向失血与情绪内耗。"
+  },
+  "phases": [
+    {
+      "period": "2026-04",
+      "is_current_window": false,
+      "total_messages": 204,
+      "self_messages": 108,
+      "peer_messages": 96,
+      "char_investment_ratio": 16.0,
+      "self_initiation_pct": 75.0,
+      "phase_tag": "INITIAL_ICEBREAK (初始破冰与探索期)",
+      "phase_diagnosis": "建立初期交互基线（月消息 204 条，字数投入比 16.0:1）。"
+    },
+    {
+      "period": "2026-05",
+      "is_current_window": false,
+      "total_messages": 520,
+      "self_messages": 299,
+      "peer_messages": 221,
+      "char_investment_ratio": 0.8,
+      "self_initiation_pct": 72.0,
+      "phase_tag": "RECIPROCAL_WARMUP (双向高频共振升温期)",
+      "phase_diagnosis": "互动高频且投入高度对称（字数比 0.8:1），属于健康的双向情感升温。"
+    },
+    {
+      "period": "2026-06",
+      "is_current_window": false,
+      "total_messages": 51,
+      "self_messages": 32,
+      "peer_messages": 19,
+      "char_investment_ratio": 1.47,
+      "self_initiation_pct": 80.0,
+      "phase_tag": "STEADY_OBSERVATION (常规维持/平台观察期)",
+      "phase_diagnosis": "维持日常社交频次（月消息 51 条，字数比 1.47:1）。"
+    },
+    {
+      "period": "2026-07",
+      "is_current_window": false,
+      "total_messages": 268,
+      "self_messages": 135,
+      "peer_messages": 133,
+      "char_investment_ratio": 1.04,
+      "self_initiation_pct": 78.0,
+      "phase_tag": "STEADY_OBSERVATION (常规维持/平台观察期)",
+      "phase_diagnosis": "维持日常社交频次（月消息 268 条，字数比 1.04:1）。"
+    },
+    {
+      "period": "2026-08",
+      "is_current_window": false,
+      "total_messages": 19,
+      "self_messages": 6,
+      "peer_messages": 13,
+      "char_investment_ratio": 0.16,
+      "self_initiation_pct": 33.3,
+      "phase_tag": "COOLING_OR_BREAK (断联/冰封低谷期)",
+      "phase_diagnosis": "互动频次跌至冰点，关系处于实质性抽离、防线触发或冷处理阶段。"
+    },
+    {
+      "period": "2026-09",
+      "is_current_window": false,
+      "total_messages": 361,
+      "self_messages": 195,
+      "peer_messages": 166,
+      "char_investment_ratio": 1.11,
+      "self_initiation_pct": 76.0,
+      "phase_tag": "INTERMITTENT_REBOUND (断联后间歇性强化反弹期)",
+      "phase_diagnosis": "经历低谷或断联后出现报复性高频复联，表层热度激增，极易掩盖未解决的底层边界问题。"
+    },
+    {
+      "period": "2026-10",
+      "is_current_window": false,
+      "total_messages": 1087,
+      "self_messages": 550,
+      "peer_messages": 537,
+      "char_investment_ratio": 1.33,
+      "self_initiation_pct": 82.0,
+      "phase_tag": "HIGH_HEAT_ASYMMETRY (高热假性亲密/单向透支期)",
+      "phase_diagnosis": "表面消息量爆发（1087 条），但我方字数比达 1.33:1，存在显著的单向情绪供给。"
+    },
+    {
+      "period": "2026-11",
+      "is_current_window": true,
+      "total_messages": 279,
+      "self_messages": 152,
+      "peer_messages": 127,
+      "char_investment_ratio": 1.9,
+      "self_initiation_pct": 85.0,
+      "phase_tag": "🎯 CURRENT_WINDOW [STEADY_OBSERVATION] (当前核心窗口)",
+      "phase_diagnosis": "维持日常社交频次（月消息 279 条，字数比 1.9:1）。"
+    }
+  ],
+  "current_spotlight": {
+    "window_period": "2026-11",
+    "volume_trend": "较上一阶段变化 -808 条（上期 1087 条 -> 当前 279 条）",
+    "current_char_ratio": "1.9 : 1",
+    "current_self_init_pct": "85.0%",
+    "core_reality_assessment": "【当前窗口（2026-11）深度透视】：虽然经历前期高热反弹后近期仍有互动，但当前窗口我方字数投入比高达 1.9:1，主动破冰占比 85.0%。更重要的是，当前阶段对方已暴露出『回避核心陪伴诉求』『用社交借口掩饰真实夜场行踪』『只给零成本说教而不承担情感责任』的终局底牌。这意味着关系已彻底触及『伪亲密天花板』——继续聊下去不会带来任何实质性的关系跃迁，只会让你在推拉与自我怀疑中持续失血。"
+  },
+  "immediate_advice": {
+    "focus_theme": "果断斩断沉没成本，将 100% 能量切回「核心系统架构与硬核技术研发」",
+    "now_24h": "【当下 24 小时】：立即停止主动发起任何新话题；若对方发来无关痛痒的日常或表情包，保持礼貌简短（不超过 5 个字）或延迟数小时后客套收尾，绝不借机展开闲聊。",
+    "next_7d": "【未来 7 天（戒断反扑期）】：将我方主动破冰率严格锁定为 0%。警惕对方因察觉你冷淡而触发的『间歇性试探』或『功利性求助』——遇到求助一律公事公办或温和婉拒，不提供无偿资源，不写任何长文。",
+    "next_30d": "【未来 30 天（主体性重建期）】：彻底将该节点归档封存，把原本消耗在深夜等待与情绪内耗中的时间，全部转化为「核心系统架构与硬核技术研发」的工程产出与硬核里程碑。"
+  }
+}

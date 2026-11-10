@@ -1,0 +1,36 @@
+__pycache__/
+*.pyc
+output/
+exports/
+media_research/
+dist/
+build/
+*.log
+# 轮转件是 siwx.log.1，*.log 匹配不到；logs/ 里还含明文微信路径与账号目录名
+logs/
+blobs.txt
+*.spec.bak
+.DS_Store
+
+# 运行时状态与本地产物
+auto_sync.json
+video/
+# 手动微信路径配置：含真实绝对路径与账号目录名，任何层级都不许入库
+wechat_paths.json
+wechat_paths.json.tmp
+
+# 工作区助手元数据（本地记忆/分析，不入库）
+.workbuddy-ai/
+
+# 本地私有产物（勿提交）
+siwx-issues-report.md
+.dsh-src/
+.zcodeignore
+.probe-effort.ps1
+.asar-extract.mjs
+.asar-header.json
+
+# 文档站（VitePress）本地产物
+node_modules/
+docs/.vitepress/cache/
+docs/.vitepress/dist/

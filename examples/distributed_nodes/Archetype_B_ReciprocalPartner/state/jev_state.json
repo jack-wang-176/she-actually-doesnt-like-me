@@ -1,0 +1,20 @@
+{
+  "schema_version": "1.0",
+  "node_id": "Archetype_B (双向同频高回报型)",
+  "node_hash": "node_demo_b02",
+  "metrics": {
+    "development_probability_pct": 92.8,
+    "expected_return_score": 100.0,
+    "expected_gain": 92.8,
+    "energy_burn_cost": 10.0,
+    "net_jev_score": 82.8,
+    "roi_ratio": 9.28
+  },
+  "decision": {
+    "verdict_code": "INVEST_STEADILY",
+    "verdict_label": "🟢 值得投入 · 稳步推进线下关系",
+    "continue_investing": true,
+    "recommended_self_initiation_pct": 50.0,
+    "action_directive": "明确结论：【值得继续投入精力】。当前去滤镜发展概率达 92.8%，净期望值 JEV 为 +82.8（正向回报周期）。双方线上线下言行一致、互动对称，建议通过共同兴趣自然转入高频线下约会。"
+  }
+}

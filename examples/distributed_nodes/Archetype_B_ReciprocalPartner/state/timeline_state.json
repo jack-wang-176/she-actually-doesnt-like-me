@@ -1,0 +1,69 @@
+{
+  "schema_version": "1.0",
+  "node_id": "Archetype_B (双向同频高回报型)",
+  "node_hash": "node_demo_b02",
+  "development_recommendation": {
+    "recommend_develop": true,
+    "banner": "✅ 建议稳步发展（双向同频，具备高正向回报）",
+    "reason": "去滤镜后发展概率达 92.8%，净期望值 Net JEV 为 +82.8，线上线下言行一致且互动高度对称，属于值得投入精力的优质双向关系。"
+  },
+  "phases": [
+    {
+      "period": "2026-08",
+      "is_current_window": false,
+      "total_messages": 320,
+      "self_messages": 165,
+      "peer_messages": 155,
+      "char_investment_ratio": 1.07,
+      "self_initiation_pct": 54.0,
+      "phase_tag": "INITIAL_ICEBREAK (初始破冰与探索期)",
+      "phase_diagnosis": "建立初期交互基线（月消息 320 条，字数投入比 1.07:1）。"
+    },
+    {
+      "period": "2026-09",
+      "is_current_window": false,
+      "total_messages": 540,
+      "self_messages": 275,
+      "peer_messages": 265,
+      "char_investment_ratio": 1.04,
+      "self_initiation_pct": 52.0,
+      "phase_tag": "RECIPROCAL_WARMUP (双向高频共振升温期)",
+      "phase_diagnosis": "互动高频且投入高度对称（字数比 1.04:1），属于健康的双向情感升温。"
+    },
+    {
+      "period": "2026-10",
+      "is_current_window": false,
+      "total_messages": 780,
+      "self_messages": 390,
+      "peer_messages": 390,
+      "char_investment_ratio": 1.03,
+      "self_initiation_pct": 50.0,
+      "phase_tag": "RECIPROCAL_WARMUP (双向高频共振升温期)",
+      "phase_diagnosis": "互动高频且投入高度对称（字数比 1.03:1），属于健康的双向情感升温。"
+    },
+    {
+      "period": "2026-11",
+      "is_current_window": true,
+      "total_messages": 480,
+      "self_messages": 240,
+      "peer_messages": 240,
+      "char_investment_ratio": 1.04,
+      "self_initiation_pct": 50.0,
+      "phase_tag": "🎯 CURRENT_WINDOW [RECIPROCAL_WARMUP] (当前核心窗口)",
+      "phase_diagnosis": "互动高频且投入高度对称（字数比 1.04:1），属于健康的双向情感升温。"
+    }
+  ],
+  "current_spotlight": {
+    "window_period": "2026-11",
+    "volume_trend": "较上一阶段变化 -300 条（上期 780 条 -> 当前 480 条）",
+    "current_char_ratio": "1.04 : 1",
+    "current_self_init_pct": "50.0%",
+    "core_reality_assessment": "【当前窗口（2026-11）深度透视】：当前处于高健康度的双向共振期（月互动 480 条，字数投入比 1.04:1，我方破冰占比 50.0%）。双方在主动性、情绪承接与线下言行一致性上均表现优异，当前正是从线上高默契转化为线下实质升温的黄金窗口。"
+  },
+  "immediate_advice": {
+    "focus_theme": "把握当前双向高热窗口，从线上共鸣自然升级至线下排他性约会",
+    "now_24h": "【当下 24 小时】：在日常高能量对话的高潮处顺势植入一个具体、低防备的线下共同体验锚点（如共同感兴趣的展览、特色餐厅或户外活动）。",
+    "next_7d": "【未来 7 天（线下兑现期）】：完成一次高质量一对一线下约会，观察其在公共场合与你并肩同行时的自然度与亲密边界反应。",
+    "next_30d": "【未来 30 天（关系确认期）】：在稳固「核心系统架构与硬核技术研发」主线（60% 精力）的同时，通过 2-3 次连续的正向线下互动完成关系自然升级。"
+  }
+}

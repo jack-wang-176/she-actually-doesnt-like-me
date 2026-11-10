@@ -1,0 +1,20 @@
+{
+  "schema_version": "1.0",
+  "node_id": "Archetype_C (礼貌疏离观察型)",
+  "node_hash": "node_demo_c03",
+  "metrics": {
+    "development_probability_pct": 54.5,
+    "expected_return_score": 71.5,
+    "expected_gain": 39.0,
+    "energy_burn_cost": 20.7,
+    "net_jev_score": 18.3,
+    "roi_ratio": 1.88
+  },
+  "decision": {
+    "verdict_code": "DOWNGRADE_OBSERVE",
+    "verdict_label": "⚠️ 降级观察 · 停止单向输出（等待对方实质投入）",
+    "continue_investing": false,
+    "recommended_self_initiation_pct": 20.0,
+    "action_directive": "明确结论：【暂停单向追加精力，转入低成本观察期】。当前去滤镜发展概率为 54.5%，净期望值 JEV 为 18.3。建议将字数比严格控制在 1:1 以内，不再主动发长文或单向迁就，观察对方是否愿意主动破冰并兑现线下排他性陪伴。"
+  }
+}

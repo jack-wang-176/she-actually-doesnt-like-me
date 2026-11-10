@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>聊天记录</title>
+<style>
+/* 与控制台同一套设计系统：暖灰底 + 微信绿单一强调色（siwx/ui/app.css）。
+   导出页是独立文件，token 值手工保持同步，改控制台 token 时记得对齐。 */
+:root {
+  color-scheme: light;
+  --bg:#f6f6f4; --chat-bg:#efefec; --header-bg:#fff; --text:#1f2320;
+  --sub:#6b726d; --tm:#9aa09a; --border:#e7e7e2; --recv:#fff;
+  --send:#a9e284; --send-line:#96d872; --send-fg:#1a2b18;
+  --accent:#07c160; --accent-fg:#067a43; --accent-soft:#e7f8ef; --accent-line:#b9e9cf;
+  --shadow:rgba(31,35,32,.06); --system-bg:#ececea;
+  --panel:#fff; --tag-bg:#f2f2ef; --link:#067a43; --media-bg:#f2f2ef;
+  --line-strong:#d8d8d2;
+}
+[data-theme="dark"] {
+  color-scheme: dark;
+  --bg:#131412; --chat-bg:#0f100e; --header-bg:#1c1e1b; --text:#e9eae6;
+  --sub:#9aa09a; --tm:#6b726d; --border:#2e312d; --recv:#1c1e1b;
+  --send:#2f9e57; --send-line:#37b063; --send-fg:#fff;
+  --accent:#14cd70; --accent-fg:#4ede96; --accent-soft:#183325; --accent-line:#2c5a40;
+  --shadow:rgba(0,0,0,.4); --system-bg:rgba(255,255,255,.08);
+  --panel:#1c1e1b; --tag-bg:#242622; --link:#4ede96; --media-bg:#242622;
+  --line-strong:#3a3e39;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;
+     background:var(--bg);color:var(--text);line-height:1.45;
+     -webkit-font-smoothing:antialiased}
+.app{max-width:940px;margin:0 auto;height:100vh;display:flex;
+     flex-direction:column;background:var(--chat-bg);box-shadow:0 0 60px var(--shadow)}
+.chat-header{background:var(--header-bg);padding:12px 18px;display:flex;
+             align-items:center;justify-content:space-between;flex-shrink:0;
+             border-bottom:1px solid var(--border)}
+.header-left{display:flex;align-items:center;gap:12px;min-width:0}
+.header-avatar{width:40px;height:40px;border-radius:12px;background:var(--accent);
+               color:#fff;display:flex;align-items:center;justify-content:center;
+               font-size:18px;font-weight:600;flex-shrink:0;overflow:hidden}
+.header-avatar img{width:100%;height:100%;object-fit:cover}
+.header-info h1{font-size:16px;font-weight:600;white-space:nowrap;overflow:hidden;
+                text-overflow:ellipsis}
+.header-meta{font-size:12px;color:var(--sub)}
+.header-actions{display:flex;gap:2px}
+.icon-btn{background:none;border:none;color:var(--sub);cursor:pointer;
+          padding:7px;border-radius:10px;transition:background .18s;
+          display:inline-flex;align-items:center;justify-content:center}
+.icon-btn svg{display:block}
+.icon-btn:hover{background:var(--tag-bg)}
+/* 统计 / 筛选：模态框（<dialog>），不再下推消息流 */
+dialog.modal{border:none;border-radius:16px;background:var(--panel);color:var(--text);
+             padding:0;width:min(480px,92vw);max-height:80vh;
+             box-shadow:0 24px 60px rgba(0,0,0,.28)}
+dialog.modal::backdrop{background:rgba(0,0,0,.45)}
+.modal-head{display:flex;align-items:center;justify-content:space-between;
+            padding:13px 18px;border-bottom:1px solid var(--border);
+            font-size:15px;font-weight:600;flex-shrink:0}
+.modal-body{padding:14px 18px;overflow-y:auto;max-height:calc(80vh - 51px)}
+.stats-row{display:flex;flex-wrap:wrap;gap:8px}
+.stat-card{background:var(--tag-bg);border-radius:10px;padding:10px 14px;
+           min-width:90px;flex:1;text-align:center}
+.stat-num{font-size:22px;font-weight:700;color:var(--accent-fg)}
+.stat-label{font-size:11px;color:var(--sub);margin-top:2px}
+/* 类型统计卡可点击跳筛选；概览卡（总消息/成员/天数）保持静态 */
+.stat-card.clickable{cursor:pointer;transition:transform .12s,box-shadow .12s}
+.stat-card.clickable:hover{transform:translateY(-2px);box-shadow:0 3px 10px var(--shadow)}
+.filter-label{font-size:12px;font-weight:600;color:var(--sub);margin-bottom:8px}
+.filter-tags{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px}
+.type-tag{display:inline-flex;align-items:center;gap:4px;padding:5px 12px;
+          border-radius:16px;border:1.5px solid var(--border);background:var(--tag-bg);
+          color:var(--text);font-size:13px;cursor:pointer;user-select:none}
+button.type-tag{font:inherit}
+.type-tag.active{background:var(--accent);color:#fff;border-color:var(--accent)}
+.filter-divider{height:1px;background:var(--border);margin:10px 0}
+.date-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.date-row input[type=date]{padding:6px 10px;border:1.5px solid var(--border);
+                           border-radius:8px;background:var(--tag-bg);color:var(--text)}
+.filter-btn{padding:6px 16px;border:none;border-radius:8px;background:var(--accent);
+            color:#fff;font-size:13px;cursor:pointer}
+.filter-btn.secondary{background:var(--tag-bg);color:var(--text);
+                      border:1.5px solid var(--border)}
+/* 生效中的筛选条件胶囊：面板关闭后条件仍然可见、可单独移除 */
+.filter-chips{display:none;flex-wrap:wrap;gap:6px;padding:8px 18px 0}
+.filter-chips.active{display:flex}
+.chip{display:inline-flex;align-items:center;gap:5px;max-width:100%;
+      background:var(--accent-soft);color:var(--accent-fg);
+      border:1px solid var(--accent-line);border-radius:999px;
+      padding:3px 7px 3px 10px;font-size:12px}
+.chip-label{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.chip-x{border:none;background:var(--accent-line);color:var(--accent-fg);flex-shrink:0;
+        width:16px;height:16px;border-radius:50%;cursor:pointer;font-size:10px;
+        line-height:1;display:flex;align-items:center;justify-content:center;padding:0}
+/* 媒体缺失汇总条：明确告知"缺了什么、为什么"，可按类型一键筛选 */
+.media-banner{display:none;flex-wrap:wrap;align-items:center;gap:6px;padding:8px 18px;
+              background:var(--accent-soft);border-bottom:1px solid var(--border)}
+.mb-title{font-size:12px;color:var(--text);font-weight:500}
+.mb-chip{display:inline-flex;align-items:center;gap:5px;border:1px solid var(--accent-line);
+         background:var(--panel);border-radius:8px;padding:3px 9px;font-size:12px;
+         cursor:pointer;color:var(--text);font:inherit;font-size:12px}
+.mb-chip:hover{border-color:var(--accent)}
+.mb-chip .mb-reason{color:var(--sub);font-size:11px}
+.mb-close{margin-left:auto;background:none;border:none;color:var(--sub);cursor:pointer;
+          padding:4px 6px;border-radius:8px;font-size:13px}
+.mb-close:hover{background:var(--tag-bg)}
+.search-bar{display:none;padding:0 18px 12px;align-items:center;gap:6px;
+            border-bottom:1px solid var(--border)}
+.search-bar.active{display:flex}
+.search-bar input{flex:1;min-width:0;padding:9px 14px;border:1px solid var(--border);
+                  border-radius:10px;background:var(--tag-bg);color:var(--text);
+                  font-size:14px;outline:none}
+#searchCount{color:var(--sub);font-size:12px;white-space:nowrap}
+.chat-body{flex:1;overflow-y:auto;padding:8px 0}
+.chat-body::-webkit-scrollbar{width:8px}
+.chat-body::-webkit-scrollbar-thumb{background:var(--line-strong);border-radius:999px}
+/* 日期分隔条吸顶：滚到哪天就钉在哪，点击打开日期跳转 */
+.date-divider{position:sticky;top:0;z-index:5;text-align:center;padding:12px 0 8px;
+              pointer-events:none}
+.date-divider span{background:var(--system-bg);color:var(--sub);padding:3px 12px;
+                   border-radius:999px;font-size:12px;font-weight:500;cursor:pointer;
+                   pointer-events:auto;box-shadow:0 2px 10px var(--shadow)}
+.system-msg{text-align:center;padding:4px 60px;margin:2px 0}
+.system-msg span{background:var(--system-bg);color:var(--sub);padding:3px 12px;
+                 border-radius:999px;font-size:12px;display:inline-block;
+                 max-width:100%;word-break:break-word}
+.msg-row{display:flex;padding:4px 14px;align-items:flex-end;gap:8px}
+.msg-row.sent{flex-direction:row-reverse}
+/* 同人连续消息：压紧行距，头像占位隐藏（保布局），气泡直角衔接 */
+.msg-row.cont{padding-top:1px}
+.msg-avatar.ghost{visibility:hidden;background:transparent}
+.msg-avatar{width:36px;height:36px;border-radius:11px;flex-shrink:0;overflow:hidden;
+            background:#cfcecb;display:flex;align-items:center;justify-content:center;
+            font-size:14px;font-weight:600;color:#fff;margin-top:2px}
+.msg-avatar img{width:100%;height:100%;object-fit:cover}
+/* 头像色板：8 个可区分色相，压暗一档保证白字对比度，与暖灰底协调 */
+.msg-avatar.c0{background:#059048}.msg-avatar.c1{background:#0e7490}
+.msg-avatar.c2{background:#6d28d9}.msg-avatar.c3{background:#0369a1}
+.msg-avatar.c4{background:#047857}.msg-avatar.c5{background:#be185d}
+.msg-avatar.c6{background:#c2410c}.msg-avatar.c7{background:#b91c1c}
+.msg-bubble{max-width:66%;min-width:60px}
+.msg-sender{font-size:12px;color:var(--sub);font-weight:500;margin-bottom:3px;padding:0 6px}
+.bubble-body{background:var(--recv);padding:8px 12px 6px;border-radius:14px;
+             border:1px solid var(--border);position:relative;
+             box-shadow:0 1px 2px var(--shadow);word-break:break-word;
+             white-space:pre-wrap;font-size:14px}
+.msg-row:not(.sent) .bubble-body{border-top-left-radius:5px}
+.msg-row.sent .bubble-body{background:var(--send);border-color:var(--send-line);
+                           color:var(--send-fg);border-top-right-radius:5px}
+/* 分组内的后续气泡：与上一条同侧直角衔接成组 */
+.msg-row.cont:not(.sent) .bubble-body{border-top-left-radius:14px}
+.msg-row.cont.sent .bubble-body{border-top-right-radius:14px}
+.msg-time{font-size:11px;color:var(--tm);text-align:right;margin-top:2px}
+/* 时间在气泡内（见 renderer.js），绿底上用气泡文字色降透明度保证可读 */
+.msg-row.sent .msg-time{color:var(--send-fg);opacity:.62}
+.msg-quote{background:var(--tag-bg);border-left:2px solid var(--line-strong);
+           border-radius:0 8px 8px 0;padding:5px 10px;margin-bottom:6px;font-size:12px;
+           color:var(--sub);white-space:pre-wrap;word-break:break-word}
+.msg-quote .qn{color:var(--accent-fg);font-weight:600}
+.msg-quote .qt{color:var(--sub);font-weight:400;font-size:10px;margin-left:6px}
+.msg-image{cursor:pointer;border-radius:6px;max-width:360px;max-height:360px;
+           display:block;object-fit:contain;background:var(--media-bg)}
+/* 占位媒体卡：媒体未包含在导出中时的语义化占位（类型 + 原因），
+   取代此前的"📷 图片未下载"光杆文本——视觉上是刻意设计的卡片而非破图 */
+.ph-card{display:flex;align-items:center;gap:9px;min-width:150px;max-width:240px;
+         padding:9px 12px;border:1.5px dashed var(--line-strong);border-radius:10px;
+         background:var(--media-bg)}
+.ph-icon{width:34px;height:34px;border-radius:9px;background:var(--tag-bg);flex-shrink:0;
+         display:flex;align-items:center;justify-content:center;font-size:17px}
+.ph-body{min-width:0}
+.ph-label{font-size:13px;font-weight:500}
+.ph-reason{font-size:11px;color:var(--sub);margin-top:1px}
+.msg-emoji{max-width:120px;max-height:120px;display:block;cursor:pointer}
+.msg-vtrans{font-size:12px;color:var(--sub);margin-top:4px;padding-top:4px;
+            border-top:1px dashed var(--border);white-space:pre-wrap;
+            word-break:break-word}
+.wx-face{width:24px;height:24px;vertical-align:-6px;margin:0 1px;display:inline-block;
+         -webkit-user-select:none;user-select:none}
+.msg-video{max-width:320px;max-height:240px;border-radius:6px;background:#000}
+.msg-voice audio{height:32px;max-width:240px}
+.wx-card{max-width:260px;padding:11px 13px;border-radius:12px;background:var(--panel);
+         border:1px solid var(--border);display:flex;gap:10px}
+.wx-card-left{width:38px;height:38px;border-radius:9px;flex-shrink:0;display:flex;
+              align-items:center;justify-content:center;font-size:18px;
+              background:var(--tag-bg)}
+.wx-card-title{font-size:14px;display:-webkit-box;-webkit-line-clamp:2;
+               -webkit-box-orient:vertical;overflow:hidden;line-height:1.35}
+.wx-card-sub{font-size:11px;color:var(--sub);margin-top:3px}
+.wx-card a{color:var(--link);text-decoration:none}
+/* 位置卡地图缩略图（导出端下载成功时替换 📍 图标，卡片加宽左栏） */
+.wx-map{width:100%;height:100%;object-fit:cover;border-radius:9px;display:block}
+.wx-card-mapleft .wx-card-left{width:64px;height:48px}
+.wx-transfer{background:#fa9e3b;border-color:transparent;color:#fff}
+.wx-transfer .wx-card-title{color:#fff;font-weight:600}
+.wx-transfer .wx-card-sub{color:rgba(255,255,255,.8)}
+.msg-record{max-width:300px;border-radius:12px;background:var(--panel);
+            border:1px solid var(--border);overflow:hidden}
+.msg-record-title{padding:9px 12px;font-size:13px;font-weight:600}
+.msg-record-items{max-height:220px;overflow-y:auto;padding:2px 12px}
+.msg-record-item{font-size:12px;padding:4px 0;border-top:1px solid var(--border);
+                 word-break:break-word}
+.msg-record-item:first-child{border-top:none}
+.msg-record-item .rs{color:var(--sub);margin-right:6px;font-weight:500}
+.msg-record-item .rt{float:right;color:var(--sub);font-size:10px;margin-left:6px}
+.msg-record-count{padding:6px 12px;font-size:11px;color:var(--sub);
+                  background:var(--media-bg)}
+/* issue #31：合并转发子项里的图片与嵌套记录 */
+.msg-record-img{max-width:120px;max-height:120px;border-radius:6px;display:block;margin:3px 0}
+.msg-record-nested .msg-record{max-width:none;margin:4px 0 0}
+/* 视频号卡片（type=51）：与聊天页同口径；封面直链过期裂图由渲染器隐藏 */
+.finder-card{max-width:280px;border:1px solid var(--border);border-radius:10px;
+             overflow:hidden;background:var(--media-bg)}
+.finder-cover{position:relative;display:block;background:#000;min-height:60px}
+.finder-cover img{display:block;max-width:100%;max-height:300px;margin:0 auto}
+.finder-play{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+             font-size:34px;color:rgba(255,255,255,.88);
+             text-shadow:0 1px 6px rgba(0,0,0,.55);pointer-events:none}
+.finder-dur{position:absolute;right:6px;bottom:6px;background:rgba(0,0,0,.55);color:#fff;
+            font-size:11px;padding:1px 6px;border-radius:4px}
+.finder-body{padding:8px 10px}
+.finder-desc{font-size:13px;white-space:pre-line;word-break:break-word}
+.finder-author{font-size:11px;color:var(--sub);margin-top:4px}
+.finder-ava{width:18px;height:18px;border-radius:4px;vertical-align:-4px;margin-right:4px}
+.wx-transfer .wx-card-left{background:rgba(255,255,255,.2);color:#fff}
+.chat-footer{background:var(--bg);text-align:center;padding:10px;font-size:12px;
+             color:var(--sub);border-top:1px solid var(--border);flex-shrink:0}
+.lightbox{display:none;position:fixed;inset:0;background:rgba(0,0,0,.92);z-index:1000;
+          align-items:center;justify-content:center}
+.lightbox.active{display:flex}
+.lightbox img{max-width:95vw;max-height:92vh;object-fit:contain;border-radius:4px;
+              -webkit-touch-callout:default;transition:transform .18s;cursor:zoom-out}
+.lightbox img.lb-zoom{transform:scale(1.8);cursor:move}
+.lb-btn{position:absolute;top:14px;background:rgba(255,255,255,.12);color:#fff;
+        border:none;border-radius:10px;padding:9px;cursor:pointer;
+        display:inline-flex;align-items:center;justify-content:center}
+.lb-btn:hover{background:rgba(255,255,255,.24)}
+.lb-close{right:14px}
+.lb-download{right:56px;color:#fff}
+.lb-counter{position:absolute;top:20px;left:18px;color:rgba(255,255,255,.85);
+            font-size:13px;font-variant-numeric:tabular-nums}
+.lb-nav{position:absolute;top:50%;transform:translateY(-50%);background:rgba(255,255,255,.12);
+        color:#fff;border:none;border-radius:50%;width:46px;height:46px;cursor:pointer;
+        display:flex;align-items:center;justify-content:center}
+.lb-nav:hover{background:rgba(255,255,255,.26)}
+.lb-prev{left:16px}
+.lb-next{right:16px}
+.lb-caption{position:absolute;bottom:16px;left:0;right:0;text-align:center;
+            color:rgba(255,255,255,.85);font-size:13px;pointer-events:none;
+            text-shadow:0 1px 4px rgba(0,0,0,.6);padding:0 60px}
+/* 悬浮导航（回到最新/日期跳转/跳到最早）：贴聊天列右下角，窄屏贴屏幕右缘 */
+.fab-stack{position:fixed;z-index:600;bottom:26px;display:flex;flex-direction:column;
+           gap:8px;right:max(14px, calc(50vw - 470px + 12px))}
+.fab-btn{width:42px;height:42px;border-radius:50%;border:1px solid var(--border);
+         background:var(--panel);color:var(--sub);cursor:pointer;display:flex;
+         align-items:center;justify-content:center;box-shadow:0 4px 16px var(--shadow);
+         transition:transform .12s,color .15s}
+.fab-btn:hover{transform:translateY(-2px);color:var(--accent-fg)}
+.date-pop{position:fixed;z-index:600;bottom:120px;display:none;
+          right:max(14px, calc(50vw - 470px + 12px))}
+.date-pop.active{display:block}
+.date-pop-row{display:flex;gap:8px;align-items:center;background:var(--panel);
+              border:1px solid var(--border);border-radius:12px;padding:10px;
+              box-shadow:0 10px 30px var(--shadow)}
+.date-pop input[type=date]{padding:6px 10px;border:1.5px solid var(--border);
+                           border-radius:8px;background:var(--tag-bg);color:var(--text)}
+.loading{text-align:center;padding:20px;color:var(--sub);font-size:13px}
+.no-result{text-align:center;padding:60px 20px;color:var(--sub);font-size:14px}
+/* 搜索命中高亮与跳转闪烁：mark 只会由渲染器注入到已转义文本上 */
+.bubble-body mark,.msg-quote mark{background:#ffe58f;color:#5c4400;border-radius:2px;padding:0 1px}
+[data-theme="dark"] .bubble-body mark,[data-theme="dark"] .msg-quote mark{background:#5c4a12;color:#ffe58f}
+.msg-row .bubble-body{transition:outline-color .8s}
+.msg-row.flash .bubble-body{outline:2px solid var(--accent);outline-offset:1px;
+                            transition:outline-color .1s}
+@media(max-width:600px){.msg-bubble{max-width:80%}.msg-image{max-width:220px}
+                        dialog.modal{width:94vw}.mb-chip .mb-reason{display:none}
+                        .lb-nav{width:38px;height:38px}.lb-prev{left:8px}.lb-next{right:8px}}
+</style>
+</head>
+<body>
+<div class="app">
+  <header class="chat-header">
+    <div class="header-left">
+      <div class="header-avatar" id="headerAva">💬</div>
+      <div class="header-info"><h1 id="chatTitle"></h1>
+        <span class="header-meta" id="chatMeta"></span></div>
+    </div>
+    <div class="header-actions">
+      <button class="icon-btn" id="statsToggle" title="统计"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 21h18"/><path d="M7 21v-8M12 21V5M17 21V10"/></svg></button>
+      <button class="icon-btn" id="filterToggle" title="筛选"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h18l-7 8v5l-4 2v-7z"/></svg></button>
+      <button class="icon-btn" id="themeToggle" title="主题"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+      <button class="icon-btn" id="searchToggle" title="搜索"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg></button>
+    </div>
+  </header>
+  <div class="media-banner" id="mediaBanner"></div>
+  <div class="filter-chips" id="filterChips"></div>
+  <div class="search-bar" id="searchBar">
+    <input type="text" id="searchInput" placeholder="搜索消息内容或发送者…">
+    <span id="searchCount"></span>
+    <button class="icon-btn" id="searchPrev" title="上一处"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 15l-6-6-6 6"/></svg></button>
+    <button class="icon-btn" id="searchNext" title="下一处"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg></button>
+    <button class="icon-btn" id="searchClose" title="关闭搜索"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6L6 18M6 6l12 12"/></svg></button>
+  </div>
+  <div class="chat-body" id="chatBody"><div id="msgContainer"></div>
+    <div class="loading" id="loadingIndicator">加载中…</div></div>
+  <footer class="chat-footer">由 stories-in-wx 导出 · 仅限个人数据备份研究</footer>
+</div>
+<div class="fab-stack">
+  <button class="fab-btn" id="fabLatest" title="回到最新"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12l7 7 7-7"/></svg></button>
+  <button class="fab-btn" id="fabDate" title="按日期跳转"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg></button>
+  <button class="fab-btn" id="fabTop" title="跳到最早"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg></button>
+</div>
+<div class="date-pop" id="datePop">
+  <div class="date-pop-row">
+    <input type="date" id="jumpDate">
+    <button class="filter-btn" id="jumpGo">跳转</button>
+  </div>
+</div>
+<dialog class="modal" id="statsPanel">
+  <div class="modal-head"><span>会话统计</span>
+    <button class="icon-btn modal-close" data-close="statsPanel" title="关闭"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6L6 18M6 6l12 12"/></svg></button></div>
+  <div class="modal-body"><div class="stats-row" id="statsRow"></div></div>
+</dialog>
+<dialog class="modal" id="filterPanel">
+  <div class="modal-head"><span>筛选</span>
+    <button class="icon-btn modal-close" data-close="filterPanel" title="关闭"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6L6 18M6 6l12 12"/></svg></button></div>
+  <div class="modal-body">
+    <div class="filter-label">消息类型</div>
+    <div class="filter-tags" id="typeFilters"></div>
+    <div class="filter-divider"></div>
+    <div class="filter-label">时间范围</div>
+    <div class="date-row">
+      <input type="date" id="fStart"><span style="color:var(--sub)">至</span>
+      <input type="date" id="fEnd">
+      <button class="filter-btn" id="fApply">确定</button>
+      <button class="filter-btn secondary" id="fReset">重置</button>
+    </div>
+  </div>
+</dialog>
+<div class="lightbox" id="lightbox">
+  <div class="lb-counter" id="lbCounter"></div>
+  <button class="lb-btn lb-close" id="lbClose" title="关闭 (Esc)"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6L6 18M6 6l12 12"/></svg></button>
+  <a class="lb-btn lb-download" id="lbDownload" title="下载此图" download><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5M12 15V3"/></svg></a>
+  <img id="lightboxImg" alt="图片大图预览" title="双击放大 / 点击关闭">
+  <button class="lb-nav lb-prev" id="lbPrev" title="上一张 (←)"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg></button>
+  <button class="lb-nav lb-next" id="lbNext" title="下一张 (→)"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg></button>
+  <div class="lb-caption" id="lbCaption"></div>
+</div>

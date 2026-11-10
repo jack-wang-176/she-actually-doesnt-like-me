@@ -1,0 +1,61 @@
+{
+  "schema_version": "1.0",
+  "node_id": "Archetype_C (礼貌疏离观察型)",
+  "node_hash": "node_demo_c03",
+  "span": {
+    "start_time": "2026-09-15 12:00:00",
+    "end_time": "2026-11-08 21:00:00",
+    "span_days": 55,
+    "active_days": 22
+  },
+  "volume": {
+    "total_messages": 340,
+    "daily_avg_messages": 6.2,
+    "self_messages": 195,
+    "peer_messages": 145,
+    "self_msg_pct": 57.4,
+    "peer_msg_pct": 42.6,
+    "self_chars": 2730,
+    "peer_chars": 1820,
+    "char_investment_ratio": 1.5,
+    "self_avg_chars": 14.0,
+    "peer_avg_chars": 12.6,
+    "self_long_msgs": 1,
+    "peer_long_msgs": 1
+  },
+  "dynamics": {
+    "total_sessions": 24,
+    "self_initiations": 16,
+    "peer_initiations": 8,
+    "self_initiation_pct": 66.7,
+    "peer_initiation_pct": 33.3,
+    "self_closings": 15,
+    "peer_closings": 9,
+    "late_night_messages": 26,
+    "late_night_pct": 7.6,
+    "silence_breaks": []
+  },
+  "latency": {
+    "self": {
+      "mean_sec": 300.0,
+      "median_sec": 60,
+      "fast_reply_pct": 35.0,
+      "slow_reply_pct": 2.0
+    },
+    "peer": {
+      "mean_sec": 620.0,
+      "median_sec": 180,
+      "fast_reply_pct": 28.0,
+      "slow_reply_pct": 5.0
+    }
+  },
+  "monthly_vectors": {
+    "2026-09": { "total": 90, "self_cnt": 50, "peer_cnt": 40, "self_chars": 700, "peer_chars": 520, "self_init_pct": 62.5 },
+    "2026-10": { "total": 160, "self_cnt": 92, "peer_cnt": 68, "self_chars": 1280, "peer_chars": 860, "self_init_pct": 66.7 },
+    "2026-11": { "total": 90, "self_cnt": 53, "peer_cnt": 37, "self_chars": 750, "peer_chars": 440, "self_init_pct": 70.0 }
+  },
+  "indices": {
+    "surface_vitality_score": 37.1,
+    "symmetry_index": 70.0
+  }
+}
