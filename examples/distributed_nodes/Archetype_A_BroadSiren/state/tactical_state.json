@@ -1,0 +1,30 @@
+{
+  "schema_version": "2.0",
+  "node_id": "Archetype_A (高秒回广谱内耗型)",
+  "node_hash": "node_demo_a01",
+  "current_fsm_state": "S5_TERMINAL_PIVOT",
+  "verdict_code": "STOP_AND_PIVOT",
+  "current_focus_title": "高危情绪反扑 / 沉没成本陷阱期（高外向低排他节点的间歇性强化收尾期）",
+  "current_essence_diagnosis": "你当前所处的并非“差一点就能走通的暧昧瓶颈”，而是典型的**「高外向低排他节点的间歇性强化收尾期」**。对方近期哪怕给出长篇文字回复，其核心操作也是通过“免责声明 + 规律作息鸡汤 + 暂不讨论感情”来完成**零成本情绪卸责**——既维持自己“体面好人”的心理舒适区，又彻底封死承担陪伴责任的可能。",
+  "recommend_develop_verdict": "绝对不建议发展",
+  "recommend_develop_reason": "真实发展率 2.4% (< 5%)，Net JEV = -64.8，继续投入属于纯负期望值内耗",
+  "circuit_breaker_armed": true,
+  "protocol_72h": [
+    {
+      "directive": "锁死主动发起率（0% Initiation）",
+      "detail": "不再发起任何日常分享、邀约或情绪倾诉；将自动化提醒或单向资源通道彻底关闭。"
+    },
+    {
+      "directive": "阻断二次回捞（Anti-Relapse Shield）",
+      "detail": "若后续对方再次因事务求助或寻找日常搭子发起低成本试探，一律采用“延迟 > 6 小时 + 极简客观事务性回复（不超过 10 个字）”，绝不重启情绪窗口。"
+    },
+    {
+      "directive": "100% 算力重路由（Mainline Re-routing）",
+      "detail": "将全部心智带宽切回高确定性正向复利的个人硬核工程与研究主线（核心系统架构与硬核技术研发）。"
+    }
+  ],
+  "protocol_30d": [
+    "物理与注意力彻底隔离：30 天内零主动破冰、零朋友圈情绪投射，彻底度过间歇性强化多巴胺戒断期。",
+    "锚定主线里程碑：将原本分配给该节点的每日时间预算 100% 转化为『核心系统架构与硬核技术研发』的可交付成果。"
+  ]
+}

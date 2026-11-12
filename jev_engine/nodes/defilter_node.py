@@ -2,19 +2,24 @@
 # -*- coding: utf-8 -*-
 """
 jev_engine/nodes/defilter_node.py
-分布式节点 2：单人“去滤镜”与深层病灶点破引擎 (DefilterPathologyNode)
-完全支持纯数学抽象状态向量与纯布尔线下信号 (Zero Chat Text Required)，精准识别五大典型内耗病灶：
-  1. [PATHOLOGY_01] 广谱社交热情错觉 (Broad Social Warmth Illusion)
-  2. [PATHOLOGY_02] 公开场合防线切割 (Public Boundary Cutting)
-  3. [PATHOLOGY_03] 货架养鱼心态与间歇性强化 (Shelf Mentality & Intermittent Reinforcement)
-  4. [PATHOLOGY_04] 双面人设与合群托词 (Alibi & Clique Conformity)
-  5. [PATHOLOGY_05] 单向失血与陪伴诉求闪避 (Unilateral Drain & Companionship Evasion)
+[v2.0 深化] 五维去滤镜 + 博弈论信号甄别引擎 (Defilter & Signaling Game Node)
+核心升级：
+  1. 博弈论信号分类 (Signaling Game Separation)：
+     - 廉价信号 (Cheap Talk, 零机会成本)：打字秒回、口头客套、不触及核心承诺的免责长文。
+     - 高昂信号 (Costly Signal, 高机会成本)：公开场合自然并肩、排他性核心时间让渡、双向主动破冰与明确边界担当。
+  2. 五大典型内耗病灶诊断与贝叶斯负向似然标志输出：
+     - PUBLIC_BOUNDARY_CUT (公开场合刻意避嫌)
+     - SHELF_MENTALITY_EXPOSED (买方货架心态言论)
+     - CORE_NEED_EVASION (长文回避核心陪伴诉求)
+     - BROAD_SOCIAL_WARMTH (广谱社交热情错觉)
+     - ALIBI_CONFORMITY_DEVIATION (双面人设与合群托词)
 输出：state/defilter_state.json
 """
 
 import json
 import re
 from pathlib import Path
+from typing import Dict, Any
 
 
 DEFAULT_OFFLINE_SIGNALS = {
@@ -25,6 +30,10 @@ DEFAULT_OFFLINE_SIGNALS = {
     "alibi_clubbing_conformity": False,
     "unilateral_resource_given": False,
     "companionship_evasion": False,
+    # v2.0 正向高昂信号 (Costly Signals)
+    "public_co_presence_verified": False,
+    "exclusive_weekend_time_yield": False,
+    "proactive_emotional_support": False,
 }
 
 
@@ -63,6 +72,50 @@ def _detect_online_anomalies(quant_state: dict, slice_shard: dict) -> dict:
     }
 
 
+def _evaluate_signaling_game(quant_state: dict, offline_signals: dict, online_anomalies: dict) -> Dict[str, Any]:
+    """区分廉价信号 (Cheap Talk) 与高昂信号 (Costly Signals)"""
+    lat = quant_state["latency"]["peer"]
+    dyn = quant_state["dynamics"]
+    vol = quant_state["volume"]
+    sym = quant_state["indices"]["symmetry_index"]
+
+    cheap_talk_signals = []
+    if lat["fast_reply_pct"] >= 50.0 and dyn["self_initiation_pct"] >= 68.0:
+        cheap_talk_signals.append("HIGH_SPEED_PASSIVE_REPLY (高秒回但零主动破冰：零机会成本的顺手礼貌)")
+    if vol.get("peer_long_msgs", 0) >= 3 and (offline_signals.get("companionship_evasion") or online_anomalies["evasive_long_reply"]):
+        cheap_talk_signals.append("DEFENSIVE_VERBOSE_DISCLAIMER (防御性说教长文：用免责鸡汤替代实质陪伴)")
+    if quant_state["indices"]["surface_vitality_score"] >= 75.0 and sym <= 50.0:
+        cheap_talk_signals.append("ASYMMETRIC_NIGHT_CHATTING (深夜高频闲聊但缺乏排他性边界确认)")
+
+    costly_signals = []
+    if offline_signals.get("public_co_presence_verified") or (sym >= 85.0 and not offline_signals.get("public_distance_cutting")):
+        costly_signals.append("PUBLIC_CO_PRESENCE (公开场合自然并肩与社交圈身份坦诚)")
+    if offline_signals.get("exclusive_weekend_time_yield") or (dyn["peer_initiation_pct"] >= 45.0 and sym >= 80.0):
+        costly_signals.append("EXCLUSIVE_TIME_YIELD (排他性核心时间让渡与双向约见兑现)")
+    if offline_signals.get("proactive_emotional_support") or (0.85 <= vol["char_investment_ratio"] <= 1.20 and dyn["peer_initiation_pct"] >= 45.0):
+        costly_signals.append("RECIPROCAL_INITIATION_AND_CARE (高对称主动破冰与实质情绪承接)")
+
+    pathology_flags = []
+    if offline_signals.get("broad_social_warmth") or online_anomalies["high_fast_reply_passive_init"]:
+        pathology_flags.append("BROAD_SOCIAL_WARMTH")
+    if offline_signals.get("public_distance_cutting"):
+        pathology_flags.append("PUBLIC_BOUNDARY_CUT")
+    if offline_signals.get("shelf_mentality_quote") or offline_signals.get("intermittent_utilitarian_contact") or online_anomalies["utilitarian_reinit"]:
+        pathology_flags.append("SHELF_MENTALITY_EXPOSED")
+    if offline_signals.get("alibi_clubbing_conformity"):
+        pathology_flags.append("ALIBI_CONFORMITY_DEVIATION")
+    if offline_signals.get("companionship_evasion") or online_anomalies["evasive_long_reply"] or (offline_signals.get("unilateral_resource_given") and online_anomalies["heavy_word_surplus"]):
+        pathology_flags.append("CORE_NEED_EVASION")
+
+    return {
+        "cheap_talk_signals": cheap_talk_signals,
+        "costly_signals": costly_signals,
+        "pathology_flags": pathology_flags,
+        "cheap_talk_count": len(cheap_talk_signals),
+        "costly_signal_count": len(costly_signals),
+    }
+
+
 def run_defilter_node(shards_dir: Path, state_dir: Path) -> dict:
     shards_dir = Path(shards_dir)
     state_dir = Path(state_dir)
@@ -81,29 +134,32 @@ def run_defilter_node(shards_dir: Path, state_dir: Path) -> dict:
         offline_path.write_text(json.dumps(offline_signals, ensure_ascii=False, indent=2), encoding="utf-8")
 
     online_anomalies = _detect_online_anomalies(quant_state, slice_shard)
+    signaling_game = _evaluate_signaling_game(quant_state, offline_signals, online_anomalies)
 
     pathologies = []
     discount_factors = []
 
-    if offline_signals["broad_social_warmth"] or online_anomalies["high_fast_reply_passive_init"]:
+    if "BROAD_SOCIAL_WARMTH" in signaling_game["pathology_flags"]:
         severity = "CRITICAL" if (offline_signals["broad_social_warmth"] and online_anomalies["high_fast_reply_passive_init"]) else "HIGH"
         discount_factors.append(0.55 if severity == "CRITICAL" else 0.72)
         pathologies.append({
             "code": "PATHOLOGY_01_BROAD_WARMTH",
+            "flag": "BROAD_SOCIAL_WARMTH",
             "title": "「广谱社交热情」被误读为「排他性偏爱」",
             "severity": severity,
             "mechanism": (
                 f"对方线上秒回率虽高（{quant_state['latency']['peer']['fast_reply_pct']}%），但你承担了 "
-                f"{quant_state['dynamics']['self_initiation_pct']}% 的主动破冰。她的热情属于高外向/销售型人格的广谱社交货币，"
-                "对其他同伴或社交圈同样熟络主动，并非针对你的专属偏爱。"
+                f"{quant_state['dynamics']['self_initiation_pct']}% 的主动破冰。她的热情属于高外向/销售型人格的广谱社交货币（Cheap Talk），"
+                "对其他同伴或社交圈同样熟络主动，并非针对你的专属高昂信号。"
             ),
             "anti_illusion_advice": "永远不要用『她回得快不快、聊得多不多』判断心意，要看她的热情是否具有排他性与稀缺性。",
         })
 
-    if offline_signals["public_distance_cutting"]:
+    if "PUBLIC_BOUNDARY_CUT" in signaling_game["pathology_flags"]:
         discount_factors.append(0.50)
         pathologies.append({
             "code": "PATHOLOGY_02_PUBLIC_CUTTING",
+            "flag": "PUBLIC_BOUNDARY_CUT",
             "title": "私下热络与公开场合避嫌的「择偶防线管理」",
             "severity": "CRITICAL",
             "mechanism": (
@@ -113,10 +169,11 @@ def run_defilter_node(shards_dir: Path, state_dir: Path) -> dict:
             "anti_illusion_advice": "一个真正喜欢你的人，在公共场合藏不住眼神与身体的偏向；公开场合的刻意避嫌，就是最诚实的拒绝。",
         })
 
-    if offline_signals["shelf_mentality_quote"] or offline_signals["intermittent_utilitarian_contact"] or online_anomalies["utilitarian_reinit"]:
+    if "SHELF_MENTALITY_EXPOSED" in signaling_game["pathology_flags"]:
         discount_factors.append(0.35)
         pathologies.append({
             "code": "PATHOLOGY_03_INTERMITTENT_SHELF",
+            "flag": "SHELF_MENTALITY_EXPOSED",
             "title": "「买方货架心态」与间歇性强化（断联—复联拉扯闭环）",
             "severity": "CRITICAL",
             "mechanism": (
@@ -127,10 +184,11 @@ def run_defilter_node(shards_dir: Path, state_dir: Path) -> dict:
             "anti_illusion_advice": "断联后对方若没有带着实质性的情感诚意回归，而是以求助、借资源或闲聊试探破冰，本质只是在清点鱼塘库存。",
         })
 
-    if offline_signals["alibi_clubbing_conformity"]:
+    if "ALIBI_CONFORMITY_DEVIATION" in signaling_game["pathology_flags"]:
         discount_factors.append(0.45)
         pathologies.append({
             "code": "PATHOLOGY_04_ALIBI_CONFORMITY",
+            "flag": "ALIBI_CONFORMITY_DEVIATION",
             "title": "隐瞒真实行踪的双面人设与底层赛道背离",
             "severity": "HIGH",
             "mechanism": (
@@ -140,10 +198,11 @@ def run_defilter_node(shards_dir: Path, state_dir: Path) -> dict:
             "anti_illusion_advice": "不必纠结她具体哪句撒了谎，当一个人需要对你伪装人设、且为了合群流连夜场时，你们早已不在同一个精神维度。",
         })
 
-    if offline_signals["companionship_evasion"] or online_anomalies["evasive_long_reply"] or (offline_signals["unilateral_resource_given"] and online_anomalies["heavy_word_surplus"]):
+    if "CORE_NEED_EVASION" in signaling_game["pathology_flags"]:
         discount_factors.append(0.40)
         pathologies.append({
             "code": "PATHOLOGY_05_COMPANIONSHIP_EVASION",
+            "flag": "CORE_NEED_EVASION",
             "title": "单向失血的「资源/情绪黑洞」与核心陪伴需求闪避",
             "severity": "CRITICAL",
             "mechanism": (
@@ -166,18 +225,21 @@ def run_defilter_node(shards_dir: Path, state_dir: Path) -> dict:
     illusion_gap = round(max(0.0, surface_score - defiltered_exclusivity_score), 1)
 
     defilter_state = {
-        "schema_version": "1.0",
+        "schema_version": "2.0",
         "node_id": quant_state["node_id"],
         "node_hash": quant_state["node_hash"],
         "surface_vitality_score": surface_score,
         "defilter_multiplier": multiplier,
         "defiltered_exclusivity_score": defiltered_exclusivity_score,
         "illusion_gap": illusion_gap,
+        "signaling_game": signaling_game,
         "online_anomalies": online_anomalies,
         "offline_signals": offline_signals,
         "pathology_count": len(pathologies),
         "detected_pathologies": pathologies,
     }
 
-    (state_dir / "defilter_state.json").write_text(json.dumps(defilter_state, ensure_ascii=False, indent=2), encoding="utf-8")
+    (state_dir / "defilter_state.json").write_text(
+        json.dumps(defilter_state, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
     return defilter_state

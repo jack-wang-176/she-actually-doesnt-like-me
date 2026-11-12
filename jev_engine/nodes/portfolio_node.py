@@ -2,12 +2,13 @@
 # -*- coding: utf-8 -*-
 """
 jev_engine/nodes/portfolio_node.py
-分布式节点 5：多人横向评估与精力投资组合分配引擎 (PortfolioAllocatorNode)
-核心设计：
-  - 采用纯分布式抽象聚合：绝不读取任何联系人的原始聊天记录，仅收集各自治节点的
-    `quant_state.json`、`defilter_state.json` 与 `jev_state.json`。
-  - 引入「个人硬核发展主线 (SELF_CORE_MAINLINE)」作为基准锚点资产（默认 P=95%, JEV=+82.0），
-    回答核心问题：『我应该把宝贵的精力投给哪个人？从哪些人身上能获得正向回报？还是应该全仓个人主线？』
+[v2.0 深化] 引入夏普比率 (Relationship Sharpe Ratio) 与情绪最大回撤 (Max Emotional Drawdown, MDD)
+的多人风险平价精力配置引擎 (PortfolioAllocatorNode)。
+
+核心公式：
+  Sharpe_i = (E[R_i] - R_base) / sigma_volatility_i
+  - 凡是夏普比率为负 (Sharpe_i < 0) 或触发 STOP_AND_PIVOT 的节点，精力配置权重自动砍为 0.0%。
+  - 直观量化将内耗精力重路由至个人硬核研发主线 (SELF_CORE_MAINLINE) 或正向同频节点的确定性增益。
 """
 
 import json
@@ -21,11 +22,16 @@ SELF_MAINLINE_BENCHMARK = {
     "surface_vitality_score": 90.0,
     "defilter_multiplier": 1.0,
     "defiltered_exclusivity_score": 90.0,
+    "prior_probability_pct": 95.0,
     "development_probability_pct": 95.0,
+    "illusion_squeezed_pct": 0.0,
     "expected_return_score": 96.0,
     "energy_burn_cost": 10.0,
     "net_jev_score": 81.2,
     "roi_ratio": 9.12,
+    "volatility_sigma": 0.25,
+    "sharpe_ratio": 1.60,
+    "max_emotional_drawdown_pct": 3.5,
     "verdict_code": "CORE_ANCHOR",
     "verdict_label": "🚀 确定性基石 · 核心精力配置锚点",
     "pathology_count": 0,
@@ -42,26 +48,35 @@ def run_portfolio_node(state_dirs: list, output_dir: Path, personal_mainline_nam
         q_path = s_dir / "quant_state.json"
         d_path = s_dir / "defilter_state.json"
         j_path = s_dir / "jev_state.json"
+        t_path = s_dir / "timeline_state.json"
         if not (q_path.exists() and d_path.exists() and j_path.exists()):
             continue
 
         q = json.loads(q_path.read_text(encoding="utf-8"))
         d = json.loads(d_path.read_text(encoding="utf-8"))
         j = json.loads(j_path.read_text(encoding="utf-8"))
+        t = json.loads(t_path.read_text(encoding="utf-8")) if t_path.exists() else {}
 
+        m = j["metrics"]
         candidates.append({
             "node_id": q["node_id"],
             "node_hash": q.get("node_hash", ""),
             "is_self_benchmark": False,
+            "current_fsm_state": t.get("current_fsm_state", "UNKNOWN"),
             "surface_vitality_score": d["surface_vitality_score"],
             "defilter_multiplier": d["defilter_multiplier"],
             "defiltered_exclusivity_score": d["defiltered_exclusivity_score"],
             "illusion_gap": d["illusion_gap"],
-            "development_probability_pct": j["metrics"]["development_probability_pct"],
-            "expected_return_score": j["metrics"]["expected_return_score"],
-            "energy_burn_cost": j["metrics"]["energy_burn_cost"],
-            "net_jev_score": j["metrics"]["net_jev_score"],
-            "roi_ratio": j["metrics"]["roi_ratio"],
+            "prior_probability_pct": m.get("prior_probability_pct", m["development_probability_pct"]),
+            "development_probability_pct": m["development_probability_pct"],
+            "illusion_squeezed_pct": m.get("illusion_squeezed_pct", 0.0),
+            "expected_return_score": m["expected_return_score"],
+            "energy_burn_cost": m["energy_burn_cost"],
+            "net_jev_score": m["net_jev_score"],
+            "roi_ratio": m["roi_ratio"],
+            "volatility_sigma": m.get("volatility_sigma", 1.0),
+            "sharpe_ratio": m.get("sharpe_ratio", 0.0),
+            "max_emotional_drawdown_pct": m.get("max_emotional_drawdown_pct", 20.0),
             "verdict_code": j["decision"]["verdict_code"],
             "verdict_label": j["decision"]["verdict_label"],
             "continue_investing": j["decision"]["continue_investing"],
@@ -71,38 +86,39 @@ def run_portfolio_node(state_dirs: list, output_dir: Path, personal_mainline_nam
 
     benchmark = dict(SELF_MAINLINE_BENCHMARK)
     if personal_mainline_name:
-        benchmark["node_id"] = f"SELF_MAINLINE ({personal_mainline_name})"
+        benchmark["node_id"] = f"SELF_CORE_MAINLINE ({personal_mainline_name})"
 
-    all_nodes = [benchmark] + sorted(candidates, key=lambda x: x["net_jev_score"], reverse=True)
+    # 风险平价与夏普比率截断规则：
+    # 凡是 sharpe_ratio < 0 或 net_jev_score <= 0 或 STOP_AND_PIVOT 的节点，权重强制砍为 0.0%
+    positive_sharpe_candidates = [
+        c for c in candidates
+        if c["sharpe_ratio"] > 0 and c["net_jev_score"] > 0 and c["verdict_code"] != "STOP_AND_PIVOT"
+    ]
+    total_positive_sharpe = sum(c["sharpe_ratio"] for c in positive_sharpe_candidates)
 
-    # 计算最优精力分配权重 (Optimal Energy Allocation %)
-    # 规则：
-    # 1. 凡是 STOP_AND_PIVOT 或 net_jev_score <= 0 的对象，精力分配权重强制为 0.0%（坚决止损）
-    # 2. 个人硬核成长主线保底配置 >= 60% 权重
-    # 3. 剩余权重按正向候选人的 max(0, net_jev_score) 比例分配
-    positive_candidates = [c for c in candidates if c["net_jev_score"] > 0 and c["verdict_code"] != "STOP_AND_PIVOT"]
-    total_positive_jev = sum(c["net_jev_score"] for c in positive_candidates)
-
-    if not positive_candidates:
+    if not positive_sharpe_candidates:
         benchmark["recommended_energy_pct"] = 100.0
         for c in candidates:
             c["recommended_energy_pct"] = 0.0
     else:
-        social_pool_cap = min(40.0, total_positive_jev * 0.8)
+        social_pool_cap = min(35.0, total_positive_sharpe * 18.0)
         benchmark["recommended_energy_pct"] = round(100.0 - social_pool_cap, 1)
         for c in candidates:
-            if c in positive_candidates:
-                c["recommended_energy_pct"] = round(social_pool_cap * (c["net_jev_score"] / total_positive_jev), 1)
+            if c in positive_sharpe_candidates:
+                c["recommended_energy_pct"] = round(social_pool_cap * (c["sharpe_ratio"] / total_positive_sharpe), 1)
             else:
                 c["recommended_energy_pct"] = 0.0
 
+    sorted_candidates = sorted(candidates, key=lambda x: (x["sharpe_ratio"], x["net_jev_score"]), reverse=True)
+
     portfolio_summary = {
-        "schema_version": "1.0",
+        "schema_version": "2.0",
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "baseline_sharpe_ratio": benchmark["sharpe_ratio"],
         "total_contacts_evaluated": len(candidates),
-        "positive_return_contacts": [c["node_id"] for c in positive_candidates],
-        "stop_loss_contacts": [c["node_id"] for c in candidates if c["verdict_code"] == "STOP_AND_PIVOT"],
-        "allocation_matrix": [benchmark] + sorted(candidates, key=lambda x: x["net_jev_score"], reverse=True),
+        "positive_return_contacts": [c["node_id"] for c in positive_sharpe_candidates],
+        "stop_loss_contacts": [c["node_id"] for c in candidates if c["recommended_energy_pct"] == 0.0],
+        "allocation_matrix": [benchmark] + sorted_candidates,
     }
 
     (output_dir / "portfolio_matrix.json").write_text(

@@ -1,0 +1,25 @@
+{
+  "schema_version": "2.0",
+  "node_id": "Archetype_C (礼貌疏离观察型)",
+  "node_hash": "node_demo_c03",
+  "current_fsm_state": "S0_INITIAL_PROBE",
+  "verdict_code": "DOWNGRADE_OBSERVE",
+  "current_focus_title": "高滤镜未验真期：线上互动流畅，但缺乏线下公开场合与实质成本付出的交叉检验",
+  "current_essence_diagnosis": "当前互动处于低烈度安全区，虽无恶性养鱼或底线背离信号，但对方尚未展现出具有高机会成本的排他性投入（Costly Signal）。此时若单方面高频加码或自我感动式输出，极易打破博弈平衡。",
+  "recommend_develop_verdict": "暂不建议升级投入",
+  "recommend_develop_reason": "当前真实发展率 23.1%，维持低成本观察，严禁自我感动式加码",
+  "circuit_breaker_armed": false,
+  "protocol_72h": [
+    {
+      "directive": "镜像配速法则（Mirror Pacing）",
+      "detail": "字数投入比严格控制在 0.8 ~ 1.2 之间，匹配对方的回复时延，绝不写单向小作文。"
+    },
+    {
+      "directive": "设置高成本试金石（Costly Signal Probe）",
+      "detail": "通过一次需要对方让渡核心周末时间或公开同行的轻量邀约，检验其真实排他意愿。"
+    }
+  ],
+  "protocol_30d": [
+    "维持 80% 算力深耕『核心系统架构与硬核技术研发』，若 30 天内对方无实质性主动破冰与线下履约，自动降级归档。"
+  ]
+}

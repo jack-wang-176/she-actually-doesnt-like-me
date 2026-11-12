@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 jev_cli.py
-she-dont-love-me (去滤镜关系期望值评估与多平台分布式 Agent 决策框架) 统一命令行入口
+JEV-Mirror v2.0 (去滤镜关系期望值评估与分布式防内耗决策框架) 统一命令行入口
 """
 
 import argparse
@@ -21,10 +21,11 @@ from jev_engine.ingestors import (
 )
 from jev_engine.nodes import (
     run_defilter_node,
-    run_jev_node,
+    run_jev_bayesian_node,
     run_portfolio_node,
     run_solace_node,
-    run_timeline_node,
+    run_tactical_advisor_node,
+    run_timeline_fsm_node,
 )
 from jev_engine.pipeline import (
     render_portfolio_report,
@@ -105,16 +106,17 @@ def cmd_analyze(args):
         )
     elif (state_dir / "quant_state.json").exists():
         run_defilter_node(shards_dir, state_dir)
-        run_jev_node(state_dir)
-        run_timeline_node(state_dir, personal_mainline=args.mainline)
+        run_jev_bayesian_node(state_dir)
+        run_timeline_fsm_node(state_dir, personal_mainline=args.mainline)
+        run_tactical_advisor_node(state_dir, personal_mainline=args.mainline)
         run_solace_node(state_dir, personal_mainline=args.mainline)
         report_path = reports_dir / "jev_single_report.md"
-        render_single_jev_report(state_dir, report_path)
+        render_single_jev_report(state_dir, report_path, node_alias=args.node)
     else:
         print(f"[-] 节点 [{args.node}] 既无 shards/ 也无预置 state/quant_state.json。")
         return 1
 
-    print(f"[✓] 单人去滤镜 JEV 与时间线评估完成！报告路径: {report_path}")
+    print(f"[✓] [JEV-Mirror v2.0] 单人深度评估与战术熔断协议已生成！报告路径: {report_path}")
     return 0
 
 
@@ -130,10 +132,11 @@ def cmd_portfolio(args):
             s_dir = d / "state"
             if (s_dir / "quant_state.json").exists():
                 run_defilter_node(d / "shards", s_dir)
-                run_jev_node(s_dir)
-                run_timeline_node(s_dir, personal_mainline=args.mainline)
+                run_jev_bayesian_node(s_dir)
+                run_timeline_fsm_node(s_dir, personal_mainline=args.mainline)
+                run_tactical_advisor_node(s_dir, personal_mainline=args.mainline)
                 run_solace_node(s_dir, personal_mainline=args.mainline)
-                render_single_jev_report(s_dir, d / "reports" / "jev_single_report.md")
+                render_single_jev_report(s_dir, d / "reports" / "jev_single_report.md", node_alias=d.name)
                 state_dirs.append(s_dir)
 
     if not state_dirs:
@@ -144,12 +147,12 @@ def cmd_portfolio(args):
     portfolio_data = run_portfolio_node(state_dirs, out_dir, personal_mainline_name=args.mainline)
     out_md = out_dir / "portfolio_allocation_report.md"
     render_portfolio_report(portfolio_data, out_md)
-    print(f"[✓] 多人横向对比与精力分配报告已生成: {out_md.resolve()}")
+    print(f"[✓] [JEV-Mirror v2.0] 多人夏普比率对比与精力分配报告已生成: {out_md.resolve()}")
     return 0
 
 
 def main():
-    parser = argparse.ArgumentParser(description="she-dont-love-me: Multi-Platform & Distributed Relationship EV Framework")
+    parser = argparse.ArgumentParser(description="JEV-Mirror v2.0: Distributed Anti-Drain & Bayesian Relationship EV Framework")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_plat = sub.add_parser("ingest-platform", help="第一层：单平台总体聊天记录汇总（支持增量去重与水位线更新）")
@@ -176,14 +179,14 @@ def main():
     p_ing.add_argument("--nodes-root", default="_private_vault/contacts", help="节点根目录 (默认: _private_vault/contacts)")
     p_ing.add_argument("--raw-dir", help="原始聊天记录目录 (默认: <nodes-root>/<node>/raw)")
 
-    p_ana = sub.add_parser("analyze", help="单人去滤镜 JEV 评估、时间线梳理与当前建议分析")
+    p_ana = sub.add_parser("analyze", help="单人去滤镜贝叶斯 JEV 评估、时间线 FSM 梳理与当下战术熔断分析")
     p_ana.add_argument("--node", required=True, help="联系人节点代号")
     p_ana.add_argument("--nodes-root", default="examples/distributed_nodes", help="节点根目录 (默认: examples/distributed_nodes)")
     p_ana.add_argument("--skip-ingest", action="store_true", help="跳过原始文件导入，直接基于已有分布式状态计算")
     p_ana.add_argument("--set-signal", nargs="*", help="设置线下校准信号 key=true/false")
     p_ana.add_argument("--mainline", default="核心系统架构与硬核技术研发", help="个人硬核发展主线名称")
 
-    p_port = sub.add_parser("portfolio", help="多人横向 JEV 对比与精力投资组合分配")
+    p_port = sub.add_parser("portfolio", help="多人横向夏普比率对比与风险平价精力投资组合分配")
     p_port.add_argument("--nodes-root", default="examples/distributed_nodes", help="包含多个自治节点的根目录")
     p_port.add_argument("--output", default="examples/portfolio_output", help="多人对比报告输出目录")
     p_port.add_argument("--mainline", default="核心系统架构与硬核技术研发", help="个人硬核发展主线名称")

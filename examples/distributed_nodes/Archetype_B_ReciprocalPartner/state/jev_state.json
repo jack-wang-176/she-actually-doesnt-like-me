@@ -1,20 +1,37 @@
 {
-  "schema_version": "1.0",
+  "schema_version": "2.0",
   "node_id": "Archetype_B (双向同频高回报型)",
   "node_hash": "node_demo_b02",
+  "bayesian_update": {
+    "prior_probability_pct": 47.5,
+    "posterior_probability_pct": 92.3,
+    "illusion_squeezed_pct": 0.0,
+    "log_odds_prior": -0.1,
+    "positive_log_likelihood": 2.58,
+    "negative_log_likelihood": 0.0,
+    "log_odds_posterior": 2.48
+  },
   "metrics": {
-    "development_probability_pct": 92.8,
-    "expected_return_score": 100.0,
-    "expected_gain": 92.8,
-    "energy_burn_cost": 10.0,
-    "net_jev_score": 82.8,
-    "roi_ratio": 9.28
+    "prior_probability_pct": 47.5,
+    "development_probability_pct": 92.3,
+    "illusion_squeezed_pct": 0.0,
+    "expected_return_score": 98.0,
+    "expected_gain": 90.5,
+    "energy_burn_cost": 8.0,
+    "net_jev_score": 82.5,
+    "roi_ratio": 11.31,
+    "volatility_sigma": 1.69,
+    "sharpe_ratio": 2.0,
+    "baseline_sharpe_ratio": 1.6,
+    "max_emotional_drawdown_pct": 33.6,
+    "recommended_energy_weight_pct": 30.0
   },
   "decision": {
     "verdict_code": "INVEST_STEADILY",
-    "verdict_label": "🟢 值得投入 · 稳步推进线下关系",
+    "verdict_label": "🟢 建议稳步推进发展（INVEST_STEADILY / 双向正反馈同频）",
     "continue_investing": true,
     "recommended_self_initiation_pct": 50.0,
-    "action_directive": "明确结论：【值得继续投入精力】。当前去滤镜发展概率达 92.8%，净期望值 JEV 为 +82.8（正向回报周期）。双方线上线下言行一致、互动对称，建议通过共同兴趣自然转入高频线下约会。"
+    "recommended_energy_weight_pct": 30.0,
+    "action_directive": "贝叶斯后验发展率达 92.3%，净期望值 Net JEV 为 +82.5（夏普比率 +2.0）。双方具备清晰的双向高昂信号（Costly Signals），建议稳步推进高价值线下共同经历。"
   }
 }

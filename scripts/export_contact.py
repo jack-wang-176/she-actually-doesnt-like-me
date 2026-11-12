@@ -71,10 +71,7 @@ def export_target_chat(target_remark, export_fmt="both"):
         print("[-] 未找到已解密的微信账号数据，请先执行: python SIWX/run.py decrypt")
         return False
 
-    found_chat = None
-    matched_display = target_remark
-    target_acc_dir = None
-    target_account = None
+    candidates = []
 
     for acc_dir in accounts:
         acc_wxid = acc_dir.name
@@ -101,47 +98,67 @@ def export_target_chat(target_remark, export_fmt="both"):
                         norm_rem = re.sub(r"\s+", "", rem).lower()
                         norm_nick = re.sub(r"\s+", "", nick).lower()
 
-                        if (norm_target and norm_target in norm_rem) or (norm_target and norm_target in norm_nick) or (norm_target == usr.lower()):
-                            found_chat = usr
-                            matched_display = rem or nick or target_remark
-                            target_acc_dir = acc_dir
-                            target_account = acc_wxid
-                            print(f"[+] 找到目标联系人: 备注='{rem}', 昵称='{nick}', wxid='{usr}'")
-                            break
-                if found_chat:
-                    break
+                        # Priority ranking: exact wxid (1) > exact remark (2) > exact nickname (3) > substring remark (4) > substring nickname (5)
+                        rank = None
+                        if norm_target == usr.lower():
+                            rank = 1
+                        elif norm_target and norm_target == norm_rem:
+                            rank = 2
+                        elif norm_target and norm_target == norm_nick:
+                            rank = 3
+                        elif norm_target and norm_target in norm_rem:
+                            rank = 4
+                        elif norm_target and norm_target in norm_nick:
+                            rank = 5
+
+                        if rank is not None:
+                            candidates.append({
+                                "rank": rank,
+                                "chat": usr,
+                                "display": rem or nick or target_remark,
+                                "remark": rem,
+                                "nickname": nick,
+                                "acc_dir": acc_dir,
+                                "acc_wxid": acc_wxid,
+                            })
             conn.close()
         except Exception as e:
             print(f"[-] 查询 {contact_db_path} 失败: {e}")
-        if found_chat:
-            break
 
-    if not found_chat:
+    if not candidates:
         print(f"[-] 在解密数据中未找到匹配 '{target_remark}' 的联系人。")
         return False
+
+    # Sort by rank ascending (1 is best)
+    candidates.sort(key=lambda x: x["rank"])
+    best = candidates[0]
+    found_chat = best["chat"]
+    matched_display = best["display"]
+    target_acc_dir = best["acc_dir"]
+    target_account = best["acc_wxid"]
+
+    print(f"[+] 找到目标联系人 (匹配等级 {best['rank']}): 备注='{best['remark']}', 昵称='{best['nickname']}', wxid='{found_chat}', 最终显示名='{matched_display}'")
 
     contact_root = init_contact_dossier(matched_display)
     raw_dir = contact_root / "raw"
 
     fmts = ["html", "json"] if export_fmt in ("all", "both") else [export_fmt]
-    for f in fmts:
-        print(f"[*] 正在导出 {f.upper()} 格式聊天记录到 {raw_dir} ...")
-        res = exporter.run_export(
-            acc_out_dir=target_acc_dir,
-            account=target_account,
-            chat=found_chat,
-            display=matched_display,
-            fmt=f,
-            want_messages=True,
-            want_media=True,
-            want_voice=True,
-            want_avatars=True,
-            export_root=CONTACTS_DIR,
-            pack="folder",
-            folder_name=f"{matched_display}/raw"
-        )
-        print(f"[✓] {f.upper()} 导出完成: {res}")
-
+    print(f"[*] 正在导出 {','.join(fmts).upper()} 格式聊天记录到 {raw_dir} ...")
+    res = exporter.run_export(
+        acc_out_dir=target_acc_dir,
+        account=target_account,
+        chat=found_chat,
+        display=matched_display,
+        fmt=fmts,
+        want_messages=True,
+        want_media=True,
+        want_voice=True,
+        want_avatars=True,
+        export_root=contact_root,
+        pack="folder",
+        folder_name="raw"
+    )
+    print(f"[✓] 导出完成: {res}")
     return True
 
 

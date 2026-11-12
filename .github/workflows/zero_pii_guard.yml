@@ -1,0 +1,27 @@
+name: Zero-PII & Vault Isolation Guard
+
+on: [push, pull_request]
+
+jobs:
+  privacy-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify _private_vault and databases are strictly absent
+        run: |
+          if [ -d "_private_vault" ] || [ -d "contacts" ] || [ -d "data" ]; then
+            echo "❌ FATAL: Private directories detected in repository tree!"
+            exit 1
+          fi
+          if find . -name "*.db" -o -name "*keystore*.json" -o -name "*pool.json" | grep -q .; then
+            echo "❌ FATAL: Raw database or platform pool files detected!"
+            exit 1
+          fi
+      - name: Scan for accidental WeChat IDs or raw chat timestamps
+        run: |
+          # 拦截任何类似 wxid_ 的真实微信号或聊天导出特征（排除底层通用解析库占位符）
+          if grep -rnE "wxid_[a-zA-Z0-9_]+" --exclude-dir=.git --exclude-dir=SIWX --exclude-dir=stories-in-wx --exclude="zero_pii_guard.yml" .; then
+            echo "❌ FATAL: Potential WeChat account identifier detected!"
+            exit 1
+          fi
+          echo "✅ Zero-PII verification passed: 100% clean architecture."

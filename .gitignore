@@ -11,7 +11,9 @@ _private_vault/
 platforms/
 contacts/
 data/
-reports/
+/reports/
+!examples/distributed_nodes/*/reports/
+!examples/distributed_nodes/*/reports/*.md
 profile/
 raw_data/
 output/
@@ -28,6 +30,7 @@ identity_links.json
 *.sqlite
 *.sqlite3
 *keystore*.json
+*pool.json
 
 # macOS / System
 .DS_Store

@@ -1,10 +1,11 @@
 {
-  "schema_version": "1.0",
+  "schema_version": "2.0",
   "node_id": "Archetype_A (高秒回广谱内耗型)",
+  "node_code": "Archetype_A_BroadSiren",
   "node_hash": "node_demo_a01",
   "span": {
-    "start_time": "2026-04-01 20:00:00",
-    "end_time": "2026-11-08 23:00:00",
+    "start_window": "W01",
+    "end_window": "NOW",
     "span_days": 217,
     "active_days": 82
   },
@@ -37,7 +38,7 @@
       {
         "silence_days": 25.0,
         "re_initiated_by": "PEER",
-        "timestamp": "2026-08-05 20:56:00",
+        "relative_window": "W15",
         "re_init_intent_code": "UTILITARIAN_RESOURCE_REQUEST",
         "utilitarian_score": 0.95
       }
@@ -57,16 +58,58 @@
       "slow_reply_pct": 0.0
     }
   },
-  "monthly_vectors": {
-    "2026-04": { "total": 204, "self_cnt": 108, "peer_cnt": 96, "self_chars": 12030, "peer_chars": 752, "self_init_pct": 75.0 },
-    "2026-05": { "total": 520, "self_cnt": 299, "peer_cnt": 221, "self_chars": 2517, "peer_chars": 3159, "self_init_pct": 72.0 },
-    "2026-06": { "total": 51, "self_cnt": 32, "peer_cnt": 19, "self_chars": 211, "peer_chars": 144, "self_init_pct": 80.0 },
-    "2026-07": { "total": 268, "self_cnt": 135, "peer_cnt": 133, "self_chars": 1008, "peer_chars": 965, "self_init_pct": 78.0 },
-    "2026-08": { "total": 19, "self_cnt": 6, "peer_cnt": 13, "self_chars": 31, "peer_chars": 193, "self_init_pct": 33.3 },
-    "2026-09": { "total": 361, "self_cnt": 195, "peer_cnt": 166, "self_chars": 1430, "peer_chars": 1287, "self_init_pct": 76.0 },
-    "2026-10": { "total": 1087, "self_cnt": 550, "peer_cnt": 537, "self_chars": 4253, "peer_chars": 3195, "self_init_pct": 82.0 },
-    "2026-11": { "total": 279, "self_cnt": 152, "peer_cnt": 127, "self_chars": 1799, "peer_chars": 946, "self_init_pct": 85.0 }
-  },
+  "window_metrics": [
+    {
+      "start_win": "W01",
+      "end_win": "W06",
+      "density_ratio": 1.65,
+      "symmetry_index": 0.48,
+      "self_initiation_rate": 0.73,
+      "char_investment_ratio": 1.65,
+      "offline_event_tag": "BROAD_WARMTH_ILLUSION",
+      "trigger_attribution": "独处与线上高频互动，误将对方的**广谱社交热情**当作排他性偏爱"
+    },
+    {
+      "start_win": "W07",
+      "end_win": "W10",
+      "density_ratio": 1.10,
+      "symmetry_index": 0.31,
+      "self_initiation_rate": 0.78,
+      "char_investment_ratio": 1.95,
+      "offline_event_tag": "PUBLIC_AVOIDANCE_AND_SHELF_QUOTE",
+      "trigger_attribution": "**公开场合避嫌切割** + 当面暴露**买方货架/备胎池言论**，触发强烈生理性下头"
+    },
+    {
+      "start_win": "W11",
+      "end_win": "W14",
+      "density_ratio": 0.06,
+      "symmetry_index": 0.50,
+      "self_initiation_rate": 0.33,
+      "char_investment_ratio": 0.85,
+      "offline_event_tag": "DEFENSIVE_RUPTURE_FREEZE",
+      "trigger_attribution": "主动抽离断联并缺席关键节点，开启自我保护防御机制"
+    },
+    {
+      "start_win": "W15",
+      "end_win": "W20",
+      "density_ratio": 1.82,
+      "symmetry_index": 0.29,
+      "self_initiation_rate": 0.35,
+      "char_investment_ratio": 2.10,
+      "offline_event_tag": "UTILITARIAN_PING",
+      "trigger_attribution": "对方以**功利性资源求助**破冰并阶段性主动约见，诱发沉没成本幻觉与二次内耗"
+    },
+    {
+      "start_win": "W21",
+      "end_win": "NOW",
+      "density_ratio": 0.40,
+      "symmetry_index": 0.22,
+      "self_initiation_rate": 0.85,
+      "char_investment_ratio": 2.35,
+      "offline_event_tag": "ALIBI_AND_CORE_NEED_EVASION",
+      "trigger_attribution": "暴露**借口掩饰夜间社交鸽约** + **长文客套说教却精准闪避核心陪伴诉求**，彻底看清底牌"
+    }
+  ],
   "indices": {
     "surface_vitality_score": 88.6,
     "symmetry_index": 40.2

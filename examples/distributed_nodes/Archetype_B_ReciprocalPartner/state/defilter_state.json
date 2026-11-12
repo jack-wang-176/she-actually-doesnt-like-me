@@ -1,11 +1,22 @@
 {
-  "schema_version": "1.0",
+  "schema_version": "2.0",
   "node_id": "Archetype_B (双向同频高回报型)",
   "node_hash": "node_demo_b02",
   "surface_vitality_score": 81.0,
   "defilter_multiplier": 1.05,
   "defiltered_exclusivity_score": 85.0,
   "illusion_gap": 0.0,
+  "signaling_game": {
+    "cheap_talk_signals": [],
+    "costly_signals": [
+      "PUBLIC_CO_PRESENCE (公开场合自然并肩与社交圈身份坦诚)",
+      "EXCLUSIVE_TIME_YIELD (排他性核心时间让渡与双向约见兑现)",
+      "RECIPROCAL_INITIATION_AND_CARE (高对称主动破冰与实质情绪承接)"
+    ],
+    "pathology_flags": [],
+    "cheap_talk_count": 0,
+    "costly_signal_count": 3
+  },
   "online_anomalies": {
     "high_fast_reply_passive_init": false,
     "heavy_word_surplus": false,
@@ -19,7 +30,10 @@
     "intermittent_utilitarian_contact": false,
     "alibi_clubbing_conformity": false,
     "unilateral_resource_given": false,
-    "companionship_evasion": false
+    "companionship_evasion": false,
+    "public_co_presence_verified": false,
+    "exclusive_weekend_time_yield": false,
+    "proactive_emotional_support": false
   },
   "pathology_count": 0,
   "detected_pathologies": []

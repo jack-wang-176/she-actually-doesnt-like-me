@@ -1,10 +1,11 @@
 {
-  "schema_version": "1.0",
+  "schema_version": "2.0",
   "node_id": "Archetype_C (礼貌疏离观察型)",
+  "node_code": "Archetype_C_PoliteAcquaintance",
   "node_hash": "node_demo_c03",
   "span": {
-    "start_time": "2026-09-15 12:00:00",
-    "end_time": "2026-11-08 21:00:00",
+    "start_window": "W01",
+    "end_window": "NOW",
     "span_days": 55,
     "active_days": 22
   },
@@ -49,11 +50,28 @@
       "slow_reply_pct": 5.0
     }
   },
-  "monthly_vectors": {
-    "2026-09": { "total": 90, "self_cnt": 50, "peer_cnt": 40, "self_chars": 700, "peer_chars": 520, "self_init_pct": 62.5 },
-    "2026-10": { "total": 160, "self_cnt": 92, "peer_cnt": 68, "self_chars": 1280, "peer_chars": 860, "self_init_pct": 66.7 },
-    "2026-11": { "total": 90, "self_cnt": 53, "peer_cnt": 37, "self_chars": 750, "peer_chars": 440, "self_init_pct": 70.0 }
-  },
+  "window_metrics": [
+    {
+      "start_win": "W01",
+      "end_win": "W04",
+      "density_ratio": 0.90,
+      "symmetry_index": 0.62,
+      "self_initiation_rate": 0.62,
+      "char_investment_ratio": 1.35,
+      "offline_event_tag": "INITIAL_SOCIAL_CONTACT",
+      "trigger_attribution": "建立初期礼貌社交连接，线上回复客气但缺乏深度个人话题延伸"
+    },
+    {
+      "start_win": "W05",
+      "end_win": "NOW",
+      "density_ratio": 0.95,
+      "symmetry_index": 0.56,
+      "self_initiation_rate": 0.68,
+      "char_investment_ratio": 1.50,
+      "offline_event_tag": "UNVERIFIED_LIGHT_INTERACTION",
+      "trigger_attribution": "维持低频客套互动，尚未经过线下排他性时间让渡检验"
+    }
+  ],
   "indices": {
     "surface_vitality_score": 37.1,
     "symmetry_index": 70.0

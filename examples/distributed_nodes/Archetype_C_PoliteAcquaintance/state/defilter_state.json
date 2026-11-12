@@ -1,11 +1,18 @@
 {
-  "schema_version": "1.0",
+  "schema_version": "2.0",
   "node_id": "Archetype_C (礼貌疏离观察型)",
   "node_hash": "node_demo_c03",
   "surface_vitality_score": 37.1,
   "defilter_multiplier": 1.05,
   "defiltered_exclusivity_score": 39.0,
   "illusion_gap": 0.0,
+  "signaling_game": {
+    "cheap_talk_signals": [],
+    "costly_signals": [],
+    "pathology_flags": [],
+    "cheap_talk_count": 0,
+    "costly_signal_count": 0
+  },
   "online_anomalies": {
     "high_fast_reply_passive_init": false,
     "heavy_word_surplus": false,
@@ -19,7 +26,10 @@
     "intermittent_utilitarian_contact": false,
     "alibi_clubbing_conformity": false,
     "unilateral_resource_given": false,
-    "companionship_evasion": false
+    "companionship_evasion": false,
+    "public_co_presence_verified": false,
+    "exclusive_weekend_time_yield": false,
+    "proactive_emotional_support": false
   },
   "pathology_count": 0,
   "detected_pathologies": []

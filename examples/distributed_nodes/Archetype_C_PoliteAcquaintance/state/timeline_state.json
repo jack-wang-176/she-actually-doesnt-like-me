@@ -1,58 +1,37 @@
 {
-  "schema_version": "1.0",
+  "schema_version": "2.0",
   "node_id": "Archetype_C (礼貌疏离观察型)",
   "node_hash": "node_demo_c03",
-  "development_recommendation": {
-    "recommend_develop": false,
-    "banner": "⚠️ 暂不建议单向发展（降级观察，等待对方实质破冰）",
-    "reason": "当前去滤镜发展概率为 54.5%（Net JEV = 18.3），尚未形成稳定的双向奔赴闭环，盲目追加投入容易掉入友谊安全区或被动消耗。"
-  },
-  "phases": [
+  "current_fsm_state": "S0_INITIAL_PROBE",
+  "current_fsm_state_cn": "破冰试探期",
+  "relapse_loop_count": 0,
+  "cusum_inflections": [],
+  "timeline_epochs": [
     {
-      "period": "2026-09",
-      "is_current_window": false,
-      "total_messages": 90,
-      "self_messages": 50,
-      "peer_messages": 40,
-      "char_investment_ratio": 1.35,
-      "self_initiation_pct": 62.5,
-      "phase_tag": "INITIAL_ICEBREAK (初始破冰与探索期)",
-      "phase_diagnosis": "建立初期交互基线（月消息 90 条，字数投入比 1.35:1）。"
+      "epoch_id": "EPOCH_01",
+      "start_window": "W01",
+      "end_window": "W04",
+      "fsm_state": "S0_INITIAL_PROBE",
+      "msg_density_ratio": 0.9,
+      "symmetry_score": 0.62,
+      "key_trigger_tag": "INITIAL_SOCIAL_CONTACT",
+      "stage_diagnosis": "建立初期礼貌社交连接，线上回复客气但缺乏深度个人话题延伸"
     },
     {
-      "period": "2026-10",
-      "is_current_window": false,
-      "total_messages": 160,
-      "self_messages": 92,
-      "peer_messages": 68,
-      "char_investment_ratio": 1.49,
-      "self_initiation_pct": 66.7,
-      "phase_tag": "STEADY_OBSERVATION (常规维持/平台观察期)",
-      "phase_diagnosis": "维持日常社交频次（月消息 160 条，字数比 1.49:1）。"
-    },
-    {
-      "period": "2026-11",
-      "is_current_window": true,
-      "total_messages": 90,
-      "self_messages": 53,
-      "peer_messages": 37,
-      "char_investment_ratio": 1.7,
-      "self_initiation_pct": 70.0,
-      "phase_tag": "🎯 CURRENT_WINDOW [STEADY_OBSERVATION] (当前核心窗口)",
-      "phase_diagnosis": "维持日常社交频次（月消息 90 条，字数比 1.7:1）。"
+      "epoch_id": "EPOCH_02",
+      "start_window": "W05",
+      "end_window": "NOW",
+      "fsm_state": "S0_INITIAL_PROBE",
+      "msg_density_ratio": 0.95,
+      "symmetry_score": 0.56,
+      "key_trigger_tag": "UNVERIFIED_LIGHT_INTERACTION",
+      "stage_diagnosis": "维持低频客套互动，尚未经过线下排他性时间让渡检验"
     }
   ],
-  "current_spotlight": {
-    "window_period": "2026-11",
-    "volume_trend": "较上一阶段变化 -70 条（上期 160 条 -> 当前 90 条）",
-    "current_char_ratio": "1.7 : 1",
-    "current_self_init_pct": "70.0%",
-    "core_reality_assessment": "【当前窗口（2026-11）深度透视】：目前互动处于低烈度安全区（月消息 90 条，我方字数比 1.7:1）。虽无恶性养鱼或欺瞒信号，但对方的主动性与情绪卷入度尚浅，当前阶段若由我方单方面高频猛攻，极易打破平衡导致对方开启回避防御。"
+  "development_recommendation": {
+    "recommend_develop": false,
+    "banner": "⚠️ 暂不建议升级投入（DOWNGRADE_OBSERVE / 维持低成本观察）",
+    "reason": "当前贝叶斯真实发展概率为 23.1%（Net JEV = 1.5），线上互动流畅但缺乏线下高昂信号检验，严禁自我感动式单向加码。"
   },
-  "immediate_advice": {
-    "focus_theme": "回收超额需求感，用『镜像对等原则』测试对方真实意愿",
-    "now_24h": "【当下 24 小时】：匹配对方的回复字数与时延节奏（字数比严格控制在 1:1 以内），不连发消息、不追问。",
-    "next_7d": "【未来 7 天（冷却测试期）】：主动破冰频次降至每周不超过 1-2 次，留出空白窗口观察对方是否会主动找话题破冰。",
-    "next_30d": "【未来 30 天（筛选裁决期）】：保持 80% 精力聚焦于「核心系统架构与硬核技术研发」；若对方在 30 天内展现正向主动并愿意配合轻量级线下见面，再逐步上调互动权重，否则自然淡出。"
-  }
+  "target_mainline": "核心系统架构与硬核技术研发"
 }
